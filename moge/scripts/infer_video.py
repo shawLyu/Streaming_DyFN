@@ -90,7 +90,7 @@ def main(
     disp_preds = []
 
     with torch.no_grad():
-        for i, frame in enumerate(frames):
+        for i, frame in tqdm(enumerate(frames), total=len(frames), desc='Inferring video'):
 
             image_tensor = torch.from_numpy(frame).permute(2, 0, 1).to(device)
             output = model.infer(image_tensor, fov_x=fov_x_, 
