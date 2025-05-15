@@ -1,0 +1,433 @@
+{
+    "data": {
+        "aspect_ratio_range": [
+            0.5,
+            2.0
+        ],
+        "area_range": [
+            250000,
+            1000000
+        ],
+        "clamp_max_depth": 1000.0,
+        "center_augmentation": 0.5,
+        "fov_range_absolute": [
+            30,
+            150
+        ],
+        "fov_range_relative": [
+            0.5,
+            1.0
+        ],
+        "image_augmentation": [
+            "jittering",
+            "jpeg_loss",
+            "blurring"
+        ],
+        "datasets": [
+            {
+                "name": "Hypersim",
+                "path": "data/moge_process_dataset/hypersim",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 5.0,
+                "center_augmentation": 0.25,
+                "fov_range_absolute": [
+                    30,
+                    150
+                ],
+                "fov_range_relative": [
+                    0.5,
+                    1.0
+                ],
+                "image_augmentation": [
+                    "jittering",
+                    "jpeg_loss",
+                    "blurring"
+                ]
+            },
+            {
+                "name": "dynamic_replica",
+                "path": "data/moge_process_dataset/dynamic_replica",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 5.0,
+                "center_augmentation": 0.25
+            },
+            {
+                "name": "irs",
+                "path": "data/moge_process_dataset/irs",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 5.8,
+                "center_augmentation": 0.25
+            },
+            {
+                "name": "kenburn3d",
+                "path": "data/moge_process_dataset/kenburn3d",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 1.6
+            },
+            {
+                "name": "spring",
+                "path": "data/moge_process_dataset/spring",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 0.7,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ],
+                "image_augmentation": [
+                    "jittering",
+                    "jpeg_loss",
+                    "blurring"
+                ]
+            },
+            {
+                "name": "structured3d",
+                "path": "data/moge_process_dataset/structured3d",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 4.8,
+                "center_augmentation": 0.25
+            },
+            {
+                "name": "tartanair",
+                "path": "data/moge_process_dataset/tartanair",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 5.0,
+                "center_augmentation": 0.25,
+                "fov_range_absolute": [
+                    30,
+                    150
+                ],
+                "fov_range_relative": [
+                    0.5,
+                    1.0
+                ],
+                "image_augmentation": [
+                    "jittering",
+                    "jpeg_loss",
+                    "blurring",
+                    "shot_noise"
+                ]
+            },
+            {
+                "name": "urban_sync",
+                "path": "data/moge_process_dataset/urban_sync",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 2.1,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ],
+                "image_augmentation": [
+                    "jittering",
+                    "jpeg_loss",
+                    "blurring",
+                    "shot_noise"
+                ]
+            },
+            {
+                "name": "midair",
+                "path": "data/moge_process_dataset/midair",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 2.7,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ],
+                "image_augmentation": [
+                    "jittering",
+                    "jpeg_loss",
+                    "blurring",
+                    "shot_noise"
+                ]
+            },
+            {
+                "name": "matrixcity",
+                "path": "data/moge_process_dataset/matrixcity",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 1.3,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ],
+                "image_augmentation": [
+                    "jittering",
+                    "jpeg_loss",
+                    "blurring",
+                    "shot_noise"
+                ]
+            },
+            {
+                "name": "blendedmvs",
+                "path": "data/moge_process_dataset/blendedmvs",
+                "label_type": "sfm",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 12.0,
+                "center_augmentation": 0.5,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ]
+            },
+            {
+                "name": "taskonomy",
+                "path": "data/moge_process_dataset/taskonomy",
+                "label_type": "sfm",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 14.1
+            },
+            {
+                "name": "fsd",
+                "path": "data/moge_process_dataset/fsd",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 2.0,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ],
+                "image_augmentation": [
+                    "jittering",
+                    "jpeg_loss",
+                    "blurring",
+                    "shot_noise"
+                ]
+            },
+            {
+                "name": "mvs_synth",
+                "path": "data/moge_process_dataset/mvs_synth",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 1.2,
+                "center_augmentation": 0.5,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ],
+                "image_augmentation": [
+                    "jittering",
+                    "jpeg_loss",
+                    "blurring",
+                    "shot_noise"
+                ]
+            },
+            {
+                "name": "arkit",
+                "path": "data/moge_process_dataset/arkit",
+                "label_type": "sfm",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 4.6,
+                "center_augmentation": 0.5,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ]
+            },
+            {
+                "name": "waymo",
+                "path": "data/moge_process_dataset/waymo",
+                "label_type": "lidar",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 5.0,
+                "fov_range_absolute": [
+                    60,
+                    120
+                ]
+            }
+        ]
+    },
+    "model_version": "v1",
+    "model": {
+        "encoder": "dinov2_vitl14",
+        "remap_output": "exp",
+        "intermediate_layers": 4,
+        "dim_upsample": [
+            256,
+            128,
+            64
+        ],
+        "dim_times_res_block_hidden": 2,
+        "num_res_blocks": 2,
+        "num_tokens_range": [
+            1200,
+            2500
+        ],
+        "last_conv_channels": 32,
+        "last_conv_size": 1
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "params": [
+            {
+                "params": {
+                    "include": [
+                        "*"
+                    ],
+                    "exclude": [
+                        "*backbone.*"
+                    ]
+                },
+                "lr": 0.0001
+            },
+            {
+                "params": {
+                    "include": [
+                        "*backbone.*"
+                    ]
+                },
+                "lr": 1e-05
+            }
+        ]
+    },
+    "lr_scheduler": {
+        "type": "SequentialLR",
+        "params": {
+            "schedulers": [
+                {
+                    "type": "LambdaLR",
+                    "params": {
+                        "lr_lambda": [
+                            "1.0",
+                            "max(0.0, min(1.0, (epoch - 1000) / 1000))"
+                        ]
+                    }
+                },
+                {
+                    "type": "StepLR",
+                    "params": {
+                        "step_size": 25000,
+                        "gamma": 0.5
+                    }
+                }
+            ],
+            "milestones": [
+                2000
+            ]
+        }
+    },
+    "low_resolution_training_steps": 50000,
+    "loss": {
+        "invalid": {},
+        "synthetic": {
+            "global": {
+                "function": "affine_invariant_global_loss",
+                "weight": 1.0,
+                "params": {
+                    "align_resolution": 32
+                }
+            },
+            "patch_4": {
+                "function": "affine_invariant_local_loss",
+                "weight": 1.0,
+                "params": {
+                    "level": 4,
+                    "align_resolution": 16,
+                    "num_patches": 16
+                }
+            },
+            "patch_16": {
+                "function": "affine_invariant_local_loss",
+                "weight": 1.0,
+                "params": {
+                    "level": 16,
+                    "align_resolution": 8,
+                    "num_patches": 256
+                }
+            },
+            "patch_64": {
+                "function": "affine_invariant_local_loss",
+                "weight": 1.0,
+                "params": {
+                    "level": 64,
+                    "align_resolution": 4,
+                    "num_patches": 4096
+                }
+            },
+            "normal": {
+                "function": "normal_loss",
+                "weight": 1.0
+            },
+            "mask": {
+                "function": "mask_l2_loss",
+                "weight": 1.0
+            }
+        },
+        "sfm": {
+            "global": {
+                "function": "affine_invariant_global_loss",
+                "weight": 1.0,
+                "params": {
+                    "align_resolution": 32
+                }
+            },
+            "patch_4": {
+                "function": "affine_invariant_local_loss",
+                "weight": 1.0,
+                "params": {
+                    "level": 4,
+                    "align_resolution": 16,
+                    "num_patches": 16
+                }
+            },
+            "patch_16": {
+                "function": "affine_invariant_local_loss",
+                "weight": 1.0,
+                "params": {
+                    "level": 16,
+                    "align_resolution": 8,
+                    "num_patches": 256
+                }
+            },
+            "mask": {
+                "function": "mask_l2_loss",
+                "weight": 1.0
+            }
+        },
+        "lidar": {
+            "global": {
+                "function": "affine_invariant_global_loss",
+                "weight": 1.0,
+                "params": {
+                    "align_resolution": 32
+                }
+            },
+            "patch_4": {
+                "function": "affine_invariant_local_loss",
+                "weight": 1.0,
+                "params": {
+                    "level": 4,
+                    "align_resolution": 16,
+                    "num_patches": 16
+                }
+            },
+            "mask": {
+                "function": "mask_l2_loss",
+                "weight": 1.0
+            }
+        }
+    }
+}
