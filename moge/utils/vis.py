@@ -17,6 +17,20 @@ def colorize_depth(depth: np.ndarray, mask: np.ndarray = None, normalize: bool =
     colored = np.ascontiguousarray((colored.clip(0, 1) * 255).astype(np.uint8))
     return colored
 
+def colorize_depth_video(disps: np.ndarray, mask: np.ndarray = None, normalize: bool = True, cmap: str = 'Spectral', min_disp: float = None, max_disp: float = None) -> np.ndarray:
+    '''
+        disp: [n, h, w]
+        mask: [n, h, w]
+    '''
+    if normalize and min_disp is not None and max_disp is not None:
+        disps = (disps - min_disp) / (max_disp - min_disp)
+
+    colored = []
+    for disp in disps:
+        colored_disp = np.nan_to_num(matplotlib.colormaps[cmap](1.0 - disp)[..., :3], 0)
+        colored.append(np.ascontiguousarray((colored_disp.clip(0, 1) * 255).astype(np.uint8)))
+    return colored
+
 
 def colorize_depth_affine(depth: np.ndarray, mask: np.ndarray = None, cmap: str = 'Spectral') -> np.ndarray:
     if mask is not None:

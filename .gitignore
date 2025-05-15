@@ -421,9 +421,10 @@ FodyWeavers.xsd
 /pretrained
 /.gradio
 /tmp
-scripts/
 hdf5_dataset_processing/
 jupyter_scripts/
 fsd_frame_info.json
 backup/
 frame_list/
+demos
+demos/
