@@ -90,9 +90,10 @@ def main(
     disp_preds = []
 
     with torch.no_grad():
-        for i, frame in tqdm(enumerate(frames), total=len(frames), desc='Inferring video'):
+        for i in tqdm(range(0, len(frames)-2, 3), total=(len(frames)-2)//3, desc='Inferring video'):
+            frames_batch = frames[i:i+3]
 
-            image_tensor = torch.from_numpy(frame).permute(2, 0, 1).to(device)
+            image_tensor = torch.from_numpy(frames_batch).permute(0, 3, 1, 2).to(device)
             output = model.infer(image_tensor, fov_x=fov_x_, 
                                  resolution_level=resolution_level, num_tokens=num_tokens, 
                                  use_fp16=use_fp16)
@@ -108,8 +109,8 @@ def main(
             depth_preds.append(depth)
             disp_preds.append(disp)
 
-    depth_preds = np.stack(depth_preds, axis=0)
-    disp_preds = np.stack(disp_preds, axis=0)
+    depth_preds = np.concatenate(depth_preds, axis=0)
+    disp_preds = np.concatenate(disp_preds, axis=0)
     min_disp, max_disp = np.nanquantile(disp_preds, 0.001), np.nanquantile(disp_preds, 0.99)
     depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp)
 

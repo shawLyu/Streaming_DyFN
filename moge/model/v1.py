@@ -5,6 +5,7 @@ from pathlib import Path
 import importlib
 import warnings
 import json
+from einops import rearrange
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,157 @@ class ResidualConvBlock(nn.Module):
         x = x + skip
         return x  
 
+class SwiGLU(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, gates = x.chunk(2, dim=-1)
+        return x * F.silu(gates)
+
+class LayerScale(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        init_values: float | torch.Tensor = 1e-5,
+        inplace: bool = False,
+    ) -> None:
+        super().__init__()
+        self.inplace = inplace
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mul_(self.gamma) if self.inplace else x * self.gamma
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        expansion: int = 4,
+        dropout: float = 0.0,
+        gated: bool = False,
+        output_dim: int | None = None,
+    ):
+        super().__init__()
+        if gated:
+            expansion = int(expansion * 2 / 3)
+        hidden_dim = int(input_dim * expansion)
+        if output_dim is None:
+            output_dim = input_dim
+        self.norm = nn.LayerNorm(input_dim)
+        self.proj1 = nn.Linear(input_dim, hidden_dim)
+        self.proj2 = nn.Linear(hidden_dim, output_dim)
+        self.act = nn.GELU() if not gated else SwiGLU()
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x)
+        x = self.proj1(x)
+        x = self.act(x)
+        x = self.proj2(x)
+        x = self.dropout(x)
+        return x
+
+class AttentionBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.0,
+        cosine: bool = False,
+        gated: bool = False,
+        layer_scale: float = 1.0,
+        context_dim: int | None = None,
+    ):
+        super().__init__()
+        self.dropout = dropout
+        self.num_heads = num_heads
+        self.hidden_dim = dim
+        context_dim = context_dim or dim
+        self.mlp = MLP(dim, expansion=expansion, dropout=dropout, gated=gated)
+        self.kv = nn.Linear(context_dim, dim * 2)
+        self.q = nn.Linear(dim, dim)
+        self.norm_attnx = nn.LayerNorm(dim)
+        self.norm_attnctx = nn.LayerNorm(context_dim)
+        self.cosine = cosine
+        self.out = nn.Linear(dim, dim)
+        self.ls1 = LayerScale(dim, layer_scale) if layer_scale > 0.0 else nn.Identity()
+        self.ls2 = LayerScale(dim, layer_scale) if layer_scale > 0.0 else nn.Identity()
+
+    def attn( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, context: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.norm_attnx(x)
+        context = self.norm_attnctx(context)
+        k, v = rearrange(self.kv(context), "b n (kv h d) -> b h n d kv", h=self.num_heads, kv=2).unbind(dim=-1)
+        q = rearrange(self.q(x), "b n (h d) -> b h n d", h=self.num_heads)
+
+        if self.cosine:
+            q, k = map(partial(F.normalize, p=2, dim=-1), (q, k))  # cosine sim
+
+        x = F.scaled_dot_product_attention( q, k, v, dropout_p=self.dropout, attn_mask=attn_bias )
+        x = rearrange(x, "b h n d -> b n (h d)")
+        x = self.out(x)
+        return x
+
+    def forward( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, context: torch.Tensor | None = None,) -> torch.Tensor:
+        context = x if context is None else context
+        x = self.ls1(self.attn( x, attn_bias=attn_bias, context=context)) + x
+        x = self.ls2(self.mlp(x)) + x
+        return x
+
+class TemporalHead(nn.Module):
+    def __init__(self, num_frames: int, hidden_dim: int, num_heads: int = 8, 
+                 expansion: int = 4, dropout: float = 0.0, layer_scale: float = 1.0):
+        super().__init__()
+
+        self.num_frames = num_frames
+        # temporal embedding
+        self.temporal_embed = nn.Parameter(torch.randn(num_frames, hidden_dim), requires_grad=True)
+        self.temporal_embed_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim),
+        )
+
+        self.temporal_attention_encoded_feature = AttentionBlock(
+            hidden_dim, num_heads=num_heads, expansion=expansion, 
+            dropout=dropout, layer_scale=layer_scale,
+        )
+
+    def build_random_frame_mask(self, B, T, device, p=0.5):
+        # mask: True indicates no attention
+        mask = torch.rand(B, T, T, device=device) < p
+        for b in range(B):
+            mask[b].fill_diagonal_(True)  # allow self-attention
+        return mask  # (B, T, T)
+
+    def forward(self, features: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+        img_h, img_w = image.shape[-2:]
+        patch_h, patch_w = img_h // 14, img_w // 14
+
+        # (B, D, H, W)
+        x_feat = torch.stack([feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous() 
+                         for feat, clstoken in features ], dim=1).permute(0, 1, 3, 4, 2)
+        BT, num_features, _, _, D = x_feat.shape
+
+        if self.training:
+            mask = self.build_random_frame_mask(BT//self.num_frames, self.num_frames, x_feat.device, p=0.5)
+            mask = mask.repeat_interleave(patch_h * patch_w, dim=0)
+        else:
+            # Build causal mask for inference - each frame can only attend to previous frames
+            mask = torch.ones(BT//self.num_frames, self.num_frames, self.num_frames, device=x_feat.device, dtype=torch.bool)
+            mask = torch.triu(mask, diagonal=1).bool().logical_not()  # Upper triangular matrix with 1s above diagonal
+            mask = mask.repeat_interleave(patch_h * patch_w, dim=0)  # Expand mask for patches
+
+        x_feat = torch.chunk(x_feat, num_features, dim=1)
+        temporal_embed = self.temporal_embed_layer(self.temporal_embed)
+
+        features = list(features)
+        for i in range(len(x_feat)):
+            encoded_feature_i = x_feat[i].reshape(BT//self.num_frames, self.num_frames, patch_h, patch_w, D)
+            encoded_feature_i = rearrange(encoded_feature_i, "b t h w c -> (b h w) t c", h=patch_h, w=patch_w)
+            encoded_feature_i = encoded_feature_i + temporal_embed.unsqueeze(0).repeat(BT//self.num_frames*patch_h*patch_w, 1, 1)
+            encoded_feature_i = self.temporal_attention_encoded_feature(encoded_feature_i, attn_bias=mask.unsqueeze(1) if mask is not None else None)
+            encoded_feature_i = rearrange(encoded_feature_i, "(b h w) t c -> (b t) (h w) c", h=patch_h, w=patch_w, t=self.num_frames, c=D)
+            features[i] = (encoded_feature_i, features[i][1])
+
+        return tuple(features)
 
 class Head(nn.Module):
     def __init__(
@@ -181,7 +333,17 @@ class MoGeModel(nn.Module):
         hub_loader = getattr(importlib.import_module(".dinov2.hub.backbones", __package__), encoder)
         self.backbone = hub_loader(pretrained=False)
         dim_feature = self.backbone.blocks[0].attn.qkv.in_features
-        
+
+        # TODO: change the parameters of the aggregation layer
+        self.aggregation_layer = TemporalHead(
+            num_frames=3,
+            hidden_dim=dim_feature,
+            num_heads=1,
+            expansion=4,
+            dropout=0.0,
+            layer_scale=1.0,
+        )
+
         self.head = Head(
             num_features=intermediate_layers if isinstance(intermediate_layers, int) else len(intermediate_layers), 
             dim_in=dim_feature, 
@@ -299,6 +461,8 @@ class MoGeModel(nn.Module):
 
         # Get intermediate layers from the backbone
         features = self.backbone.get_intermediate_layers(image_14, self.intermediate_layers, return_class_token=True)
+
+        features = self.aggregation_layer(features, image)
 
         # Predict points (and mask)
         output = self.head(features, image)

@@ -8,6 +8,7 @@ import traceback
 import itertools
 from numbers import Number
 import io
+from collections import defaultdict
 
 import numpy as np
 import cv2
@@ -33,6 +34,7 @@ class TrainDataLoaderPipeline:
         self.center_augmentation = config.get('center_augmentation', 0.0)
         self.image_augmentation = config.get('image_augmentation', [])
         self.depth_interpolation = config.get('depth_interpolation', 'bilinear')
+        self.sampled_sequence_length = config.get('sampled_sequence_length', 3)
 
         if 'image_sizes' in config:
             self.image_size_strategy = 'fixed'
@@ -50,10 +52,17 @@ class TrainDataLoaderPipeline:
             name = dataset['name']
             content = Path(dataset['path'], dataset.get('index', '.index.txt')).joinpath().read_text()
             filenames = content.splitlines()
+            sequence_to_files = defaultdict(list)
+            for f in filenames:
+                sequence_to_files['/'.join(f.split('/')[:-1])].append(f)
+            sequences = sorted(sequence_to_files.keys())
+
             self.datasets[name] = {
                 **dataset,
                 'path': dataset['path'],
                 'filenames': filenames,
+                'sequences': sequences,
+                'sequence_to_files': sequence_to_files,
             }
         self.dataset_names = [dataset['name'] for dataset in config['datasets']]
         self.dataset_weights = [dataset['weight'] for dataset in config['datasets']]
@@ -64,7 +73,7 @@ class TrainDataLoaderPipeline:
             pipeline.Unbatch(),
             pipeline.Parallel([self._load_instance] * num_load_workers),
             pipeline.Parallel([self._process_instance] * num_process_workers),
-            pipeline.Batch(self.batch_size),
+            pipeline.Batch(self.batch_size * self.sampled_sequence_length),
             self._collate_batch,
             pipeline.Buffer(buffer_size),
         ])
@@ -83,25 +92,37 @@ class TrainDataLoaderPipeline:
         last_area = None
         while True:
             # Depending on the sample strategy, choose a dataset and a filename
-            batch_id += 1
             batch = []
             
             # Sample instances
             for _ in range(self.batch_size):
                 dataset_name = random.choices(self.dataset_names, weights=self.dataset_weights)[0]
-                filename = random.choice(self.datasets[dataset_name]['filenames'])
+                sequence_name = random.choice(self.datasets[dataset_name]['sequences'])
+                sequence_filenames = self.datasets[dataset_name]['sequence_to_files'][sequence_name]
+                # Sample k continuous frames from the sequence
+                if len(sequence_filenames) < self.sampled_sequence_length:
+                    # If sequence is too short, just repeat the last frame
+                    start_idx = 0
+                    sampled_filenames = sequence_filenames + [sequence_filenames[-1]] * (self.sampled_sequence_length - len(sequence_filenames))
+                else:
+                    # Randomly select a starting point that allows k continuous frames
+                    start_idx = random.randint(0, len(sequence_filenames) - self.sampled_sequence_length)
+                    sampled_filenames = sequence_filenames[start_idx:start_idx + self.sampled_sequence_length]
 
-                path = Path(self.datasets[dataset_name]['path'], filename)
-
-                instance = {
-                    'batch_id': batch_id,
-                    'seed': random.randint(0, 2 ** 32 - 1),
-                    'dataset': dataset_name,
-                    'filename': filename,
-                    'path': path,
-                    'label_type': self.datasets[dataset_name]['label_type'],
-                }
-                batch.append(instance)
+                seed = random.randint(0, 2 ** 32 - 1)
+                for filename in sampled_filenames:
+                    batch_id += 1
+                    path = Path(self.datasets[dataset_name]['path'], filename)
+                    instance = {
+                        'batch_id': batch_id,
+                        'seed': seed,
+                        'dataset': dataset_name,
+                        'filename': filename,
+                        'path': path,
+                        'label_type': self.datasets[dataset_name]['label_type'],
+                        'sequence_name': sequence_name,
+                    }
+                    batch.append(instance)
 
             # Decide the image size for this batch
             if self.image_size_strategy == 'fixed':
