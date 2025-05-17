@@ -88,9 +88,9 @@ def main(
 
     depth_preds = []
     disp_preds = []
-
     with torch.no_grad():
-        for i in tqdm(range(0, len(frames)-2, 3), total=(len(frames)-2)//3, desc='Inferring video'):
+        # Use sliding window of size 3 with stride 1
+        for i in tqdm(range(len(frames)-2), total=len(frames)-2, desc='Inferring video'):
             frames_batch = frames[i:i+3]
 
             image_tensor = torch.from_numpy(frames_batch).permute(0, 3, 1, 2).to(device)
@@ -106,8 +106,12 @@ def main(
             # Prepare the depth visualization
             depth = np.where((depth > 0) & mask, depth, np.nan)
             disp = 1 / depth
-            depth_preds.append(depth)
-            disp_preds.append(disp)
+            if i == 0:
+                depth_preds.append(depth)
+                disp_preds.append(disp)
+            else:
+                depth_preds.append(depth[-1][None,...])
+                disp_preds.append(disp[-1][None,...])
 
     depth_preds = np.concatenate(depth_preds, axis=0)
     disp_preds = np.concatenate(disp_preds, axis=0)
