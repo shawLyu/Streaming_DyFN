@@ -50,6 +50,7 @@ from moge.test.metrics import compute_metrics
 @click.option('--workspace', type=str, default='workspace/debug', help='Path to the workspace')
 @click.option('--checkpoint', 'checkpoint_path', type=str, default=None, help='Path to the checkpoint to load')
 @click.option('--batch_size_forward', type=int, default=8, help='Batch size for each forward pass on each device')
+@click.option('--sequence_length', type=int, default=3, help='Number of sequences to train on')
 @click.option('--gradient_accumulation_steps', type=int, default=1, help='Number of steps to accumulate gradients')
 @click.option('--enable_gradient_checkpointing', type=bool, default=True, help='Use gradient checkpointing in backbone')
 @click.option('--enable_mixed_precision', type=bool, default=False, help='Use mixed precision training. Backbone is converted to FP16')
@@ -58,7 +59,7 @@ from moge.test.metrics import compute_metrics
 @click.option('--save_every', type=int, default=10000, help='Save checkpoint every n iterations')
 @click.option('--log_every', type=int, default=1000, help='Log metrics every n iterations')
 @click.option('--vis_every', type=int, default=0, help='Visualize every n iterations')
-@click.option('--num_vis_images', type=int, default=32, help='Number of images to visualize, must be a multiple of divided batch size')
+@click.option('--num_vis_images', type=int, default=24, help='Number of images to visualize, must be a multiple of divided batch size')
 @click.option('--enable_mlflow', type=bool, default=True, help='Log metrics to MLFlow')
 @click.option('--seed', type=int, default=0, help='Random seed')
 def main(
@@ -66,6 +67,7 @@ def main(
     workspace: str,
     checkpoint_path: str,
     batch_size_forward: int,
+    sequence_length: int,
     gradient_accumulation_steps: int,
     enable_gradient_checkpointing: bool,
     enable_mixed_precision: bool,
@@ -232,8 +234,9 @@ def main(
         # Get some batches for visualization
         if accelerator.is_main_process:
             batches_for_vis: List[Dict[str, torch.Tensor]] = []
-            num_vis_images = num_vis_images // batch_size_forward * batch_size_forward
-            for _ in range(num_vis_images // batch_size_forward):
+            # TODO: We give the fixed number of sequences length here. We need to fix it later.
+            num_vis_images = num_vis_images // batch_size_forward // sequence_length * batch_size_forward * sequence_length
+            for _ in range(num_vis_images // batch_size_forward // sequence_length):
                 batch = train_data_pipe.get()
                 batches_for_vis.append(batch)
 
@@ -245,7 +248,7 @@ def main(
                 gt_points = utils3d.torch.depth_to_points(gt_depth, intrinsics=gt_intrinsics)
                 gt_normal, gt_normal_mask = utils3d.torch.points_to_normals(gt_points, gt_mask)
                 for i_instance in range(batch['image'].shape[0]):
-                    idx = i_batch * batch_size_forward + i_instance
+                    idx = i_batch * batch_size_forward * sequence_length + i_instance
                     image_i = (image[i_instance].numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                     gt_depth_i = gt_depth[i_instance].numpy()
                     gt_mask_i = gt_mask[i_instance].numpy()
@@ -436,7 +439,7 @@ def main(
                         image = image.cpu().numpy()
 
                         for i_instance in range(image.shape[0]):
-                            idx = i_batch * batch_size_forward + i_instance
+                            idx = i_batch * batch_size_forward * sequence_length + i_instance
                             image_i = (image[i_instance].transpose(1, 2, 0) * 255).astype(np.uint8)
                             pred_points_i = pred_points[i_instance]
                             pred_mask_i = pred_mask[i_instance]
