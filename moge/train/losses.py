@@ -39,11 +39,28 @@ def affine_invariant_global_loss(
 ):
     device = pred_points.device
 
-    # Align
-    (pred_points_lr, gt_points_lr), lr_mask = mask_aware_nearest_resize((pred_points, gt_points), mask=mask, size=(align_resolution, align_resolution))
-    scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
-    valid = scale > 0
-    scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
+    if pred_points.dim() == 3:
+        # Align
+        (pred_points_lr, gt_points_lr), lr_mask = mask_aware_nearest_resize((pred_points, gt_points), mask=mask, size=(align_resolution, align_resolution))
+        scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
+        valid = scale > 0
+        scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
+    elif pred_points.dim() == 4:
+        pred_points_list, gt_points_list, mask_list = [], [], []
+        for pred_points_i, gt_points_i, mask_i in zip(pred_points, gt_points, mask):
+            # Align
+            (pred_points_lr, gt_points_lr), lr_mask = mask_aware_nearest_resize((pred_points_i, gt_points_i), mask=mask_i, size=(align_resolution, align_resolution))
+            pred_points_list.append(pred_points_lr)
+            gt_points_list.append(gt_points_lr)
+            mask_list.append(lr_mask)
+        pred_points_lr = torch.cat(pred_points_list, dim=0)
+        gt_points_lr = torch.cat(gt_points_list, dim=0)
+        lr_mask = torch.cat(mask_list, dim=0)
+        scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
+        valid = scale > 0
+        scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
+    else:
+        raise ValueError(f'Invalid pred_points dimension: {pred_points.dim()}')
 
     pred_points = scale[..., None, None, None] * pred_points + shift[..., None, None, :]
 
@@ -51,6 +68,8 @@ def affine_invariant_global_loss(
     weight = (valid[..., None, None] & mask).float() / gt_points[..., 2].clamp_min(1e-5)
     weight = weight.clamp_max(10.0 * weighted_mean(weight, mask, dim=(-2, -1), keepdim=True))   # In case your data contains extremely small depth values
     loss = _smooth((pred_points - gt_points).abs() * weight[..., None], beta=beta).mean(dim=(-3, -2, -1))
+    if pred_points.dim() == 4:
+        loss = loss.sum(dim=0)
 
     if sparsity_aware:
         # Reweighting improves performance on sparse depth data. NOTE: this is not used in MoGe-1.

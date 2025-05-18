@@ -1,6 +1,3 @@
-source /home/luban/miniconda3/etc/profile.d/conda.sh
-conda activate video_depth
-
 echo $RESOURCE_NUM_GPU
 echo $DISTRIBUTED_NODE_COUNT
 echo $DISTRIBUTED_NODE_RANK
@@ -30,9 +27,9 @@ export NCCL_DEBUG=WARN
 export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $(($RESOURCE_NUM_GPU - 1)))
 
 echo "[INFO] Starting accelerate launch..."
-CFG=${1:-"configs/train/v1_train_B1024.json"}
+CFG=${1:-"configs/train/video_finetune_luban.json"}
 
-WORKSPACE=${2:-"workspace/v1_reimplement/train_luban_B1024_sfm"}
+WORKSPACE=${2:-"workspace/video_finetune_luban"}
 
 accelerate launch \
     --multi_gpu \
@@ -46,11 +43,11 @@ accelerate launch \
         --workspace $WORKSPACE \
         --gradient_accumulation_steps 1 \
         --batch_size_forward 4 \
-        --checkpoint latest \
+        --checkpoint pretrained_moge/image_pretrained_moge.pt  \
         --enable_gradient_checkpointing False \
         --vis_every 500 \
         --enable_mlflow True \
         --enable_mixed_precision True \
         --num_iterations 400000 \
-        --save_every 2000 \
+        --save_every 1000 \
         --log_every 100

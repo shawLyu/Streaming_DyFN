@@ -111,7 +111,8 @@
     "optimizer": {
         "type": "AdamW",
         "params": [
-            {"params": {"include": ["*"], "exclude": ["*backbone.*"]}, "lr": 1e-6},
+            {"params": {"include": ["*aggregation_layer.*"], "lr": 5e-6}},
+            {"params": {"include": ["*"], "exclude": ["*aggregation_layer.*", "*backbone.*"]}, "lr": 1e-6},
             {"params": {"include": ["*backbone.*"]}, "lr": 1e-7}
         ]
     },
@@ -119,13 +120,13 @@
         "type": "SequentialLR",
         "params": {
             "schedulers": [
-                {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "max(0.0, min(1.0, (epoch - 100) / 100))"]}},
-                {"type": "StepLR", "params": {"step_size": 5000, "gamma": 0.5}}
+                {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "1.0", "max(0.0, min(1.0, (epoch - 1000) / 1000))"]}},
+                {"type": "StepLR", "params": {"step_size": 20000, "gamma": 0.5}}
             ],
-            "milestones": [1000]
+            "milestones": [10000]
         }
     },
-    "low_resolution_training_steps": 5000,
+    "low_resolution_training_steps": 1000,
     "loss": {
         "invalid": {},
         "synthetic": {
@@ -144,8 +145,7 @@
         },
         "lidar": {
             "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
-            "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
-            "mask": {"function": "mask_l2_loss", "weight": 1.0}
+            "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}}
         }
     }
 }

@@ -86,6 +86,8 @@ def main(
 
     height, width = frames.shape[1:3]
 
+    temp_depth_preds = [[], [], []]
+    temp_disp_preds = [[], [], []]
     depth_preds = []
     disp_preds = []
     with torch.no_grad():
@@ -105,18 +107,32 @@ def main(
 
             # Prepare the depth visualization
             depth = np.where((depth > 0) & mask, depth, np.nan)
-            disp = 1 / depth
-            if i == 0:
-                depth_preds.append(depth)
-                disp_preds.append(disp)
+            if len(temp_depth_preds[0]) == 0:
+                for j in range(3):
+                    temp_depth_preds[j].append(depth[j][None,...])
             else:
-                depth_preds.append(depth[-1][None,...])
-                disp_preds.append(disp[-1][None,...])
+                temp_depth_preds.append([])
+                merged_depth = temp_depth_preds.pop(0)
+                merged_depth = np.concatenate(merged_depth, axis=0)
+                merged_depth = np.mean(merged_depth, axis=0)
+                merged_disp = 1 / merged_depth
+                depth_preds.append(merged_depth[None,...])
+                disp_preds.append(merged_disp[None,...])
+                for j in range(3):
+                    temp_depth_preds[j].append(depth[j][None,...])
 
+    while len(temp_depth_preds) > 0:
+        merged_depth = temp_depth_preds.pop(0)
+        merged_depth = np.concatenate(merged_depth, axis=0)
+        merged_depth = np.mean(merged_depth, axis=0)
+        merged_disp = 1 / merged_depth
+        depth_preds.append(merged_depth[None,...])
+        disp_preds.append(merged_disp[None,...])
+    
     depth_preds = np.concatenate(depth_preds, axis=0)
     disp_preds = np.concatenate(disp_preds, axis=0)
     min_disp, max_disp = np.nanquantile(disp_preds, 0.001), np.nanquantile(disp_preds, 0.99)
-    depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp)
+    depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp, cmap='magma')
 
     if save_video:
         Path(output_dir).mkdir(parents=True, exist_ok=True)

@@ -305,6 +305,12 @@ def main(
                             weight_dict[k] = v['weight']
                             if v['function'] == 'affine_invariant_global_loss':
                                 loss_dict[k], misc_dict[k], gt_metric_scale = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'])
+                                if (i + 1) % sequence_length == 0:
+                                    loss_dict['video_' + k], misc_dict['video_' + k], _ = affine_invariant_global_loss(pred_points[i-sequence_length+1:i+1], 
+                                                                                                             gt_points[i-sequence_length+1:i+1], 
+                                                                                                             gt_mask[i-sequence_length+1:i+1], 
+                                                                                                             **v['params'])
+                                    weight_dict['video_' + k] = v['weight']
                             elif v['function'] == 'affine_invariant_local_loss':
                                 loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
                             elif v['function'] == 'normal_loss':
