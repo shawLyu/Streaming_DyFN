@@ -132,7 +132,7 @@ def main(
     depth_preds = np.concatenate(depth_preds, axis=0)
     disp_preds = np.concatenate(disp_preds, axis=0)
     min_disp, max_disp = np.nanquantile(disp_preds, 0.001), np.nanquantile(disp_preds, 0.99)
-    depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp, cmap='magma')
+    depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp)
 
     if save_video:
         Path(output_dir).mkdir(parents=True, exist_ok=True)

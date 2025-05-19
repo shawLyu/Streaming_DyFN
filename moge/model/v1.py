@@ -132,7 +132,7 @@ class AttentionBlock(nn.Module):
         self.ls1 = LayerScale(dim, layer_scale) if layer_scale > 0.0 else nn.Identity()
         self.ls2 = LayerScale(dim, layer_scale) if layer_scale > 0.0 else nn.Identity()
 
-    def attn( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, context: torch.Tensor | None = None) -> torch.Tensor:
+    def attn( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, context: torch.Tensor | None = None, is_causal: bool = False) -> torch.Tensor:
         x = self.norm_attnx(x)
         context = self.norm_attnctx(context)
         k, v = rearrange(self.kv(context), "b n (kv h d) -> b h n d kv", h=self.num_heads, kv=2).unbind(dim=-1)
@@ -141,20 +141,27 @@ class AttentionBlock(nn.Module):
         if self.cosine:
             q, k = map(partial(F.normalize, p=2, dim=-1), (q, k))  # cosine sim
 
-        x = F.scaled_dot_product_attention( q, k, v, dropout_p=self.dropout, attn_mask=attn_bias )
+        # if is_causal:
+        #     x = F.scaled_dot_product_attention( q, k, v, dropout_p=self.dropout, is_causal=is_causal )
+        # else:
+        x = F.scaled_dot_product_attention( q, k, v, dropout_p=self.dropout)
         x = rearrange(x, "b h n d -> b n (h d)")
         x = self.out(x)
         return x
 
-    def forward( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, context: torch.Tensor | None = None,) -> torch.Tensor:
+    def forward( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, context: torch.Tensor | None = None, is_causal: bool = False) -> torch.Tensor:
         context = x if context is None else context
-        x = self.ls1(self.attn( x, attn_bias=attn_bias, context=context)) + x
+        x = self.ls1(self.attn( x, attn_bias=attn_bias, context=context, is_causal=is_causal)) + x
         x = self.ls2(self.mlp(x)) + x
         return x
 
 class TemporalHead(nn.Module):
-    def __init__(self, num_frames: int, hidden_dim: int, num_heads: int = 8, 
-                 expansion: int = 4, dropout: float = 0.0, layer_scale: float = 1.0):
+    def __init__(self, num_frames: int, 
+                 hidden_dim: int, 
+                 num_heads: int = 8, 
+                 expansion: int = 4, 
+                 dropout: float = 0.0, 
+                 layer_scale: float = 1.0):
         super().__init__()
 
         self.num_frames = num_frames
@@ -165,10 +172,12 @@ class TemporalHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim),
         )
 
-        self.temporal_attention_encoded_feature = AttentionBlock(
-            hidden_dim, num_heads=num_heads, expansion=expansion, 
-            dropout=dropout, layer_scale=layer_scale,
-        )
+        self.temporal_attention = nn.ModuleList([
+            AttentionBlock(
+                hidden_dim, num_heads=num_heads, expansion=expansion, 
+                dropout=dropout, layer_scale=layer_scale,
+            ) for _ in range(4)
+        ])
 
     def build_random_frame_mask(self, B, T, device, p=0.5):
         # mask: True indicates no attention
@@ -177,7 +186,7 @@ class TemporalHead(nn.Module):
             mask[b].fill_diagonal_(True)  # allow self-attention
         return mask  # (B, T, T)
 
-    def forward(self, features: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, image: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
         img_h, img_w = image.shape[-2:]
         patch_h, patch_w = img_h // 14, img_w // 14
 
@@ -186,7 +195,7 @@ class TemporalHead(nn.Module):
                          for feat, clstoken in features ], dim=1).permute(0, 1, 3, 4, 2)
         BT, num_features, _, _, D = x_feat.shape
 
-        if self.training:
+        if self.training and not is_causal:
             mask = self.build_random_frame_mask(BT//self.num_frames, self.num_frames, x_feat.device, p=0.5)
             mask = mask.repeat_interleave(patch_h * patch_w, dim=0)
         else:
@@ -203,7 +212,7 @@ class TemporalHead(nn.Module):
             encoded_feature_i = x_feat[i].reshape(BT//self.num_frames, self.num_frames, patch_h, patch_w, D)
             encoded_feature_i = rearrange(encoded_feature_i, "b t h w c -> (b h w) t c", h=patch_h, w=patch_w)
             encoded_feature_i = encoded_feature_i + temporal_embed.unsqueeze(0).repeat(BT//self.num_frames*patch_h*patch_w, 1, 1)
-            encoded_feature_i = self.temporal_attention_encoded_feature(encoded_feature_i, attn_bias=mask.unsqueeze(1) if mask is not None else None)
+            encoded_feature_i = self.temporal_attention[i](encoded_feature_i, attn_bias=mask.unsqueeze(1) if mask is not None else None, is_causal=is_causal)
             encoded_feature_i = rearrange(encoded_feature_i, "(b h w) t c -> (b t) (h w) c", h=patch_h, w=patch_w, t=self.num_frames, c=D)
             features[i] = (encoded_feature_i, features[i][1])
 
@@ -338,7 +347,7 @@ class MoGeModel(nn.Module):
         self.aggregation_layer = TemporalHead(
             num_frames=3,
             hidden_dim=dim_feature,
-            num_heads=1,
+            num_heads=8,
             expansion=4,
             dropout=0.0,
             layer_scale=1.0,
@@ -462,7 +471,7 @@ class MoGeModel(nn.Module):
         # Get intermediate layers from the backbone
         features = self.backbone.get_intermediate_layers(image_14, self.intermediate_layers, return_class_token=True)
 
-        features = self.aggregation_layer(features, image)
+        features = self.aggregation_layer(features, image, is_causal=True)
 
         # Predict points (and mask)
         output = self.head(features, image)

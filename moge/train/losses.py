@@ -69,7 +69,7 @@ def affine_invariant_global_loss(
     weight = weight.clamp_max(10.0 * weighted_mean(weight, mask, dim=(-2, -1), keepdim=True))   # In case your data contains extremely small depth values
     loss = _smooth((pred_points - gt_points).abs() * weight[..., None], beta=beta).mean(dim=(-3, -2, -1))
     if pred_points.dim() == 4:
-        loss = loss.sum(dim=0)
+        loss = loss.mean(dim=0)
 
     if sparsity_aware:
         # Reweighting improves performance on sparse depth data. NOTE: this is not used in MoGe-1.

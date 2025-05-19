@@ -3,7 +3,7 @@ conda activate video_depth
 
 CFG=${1:-"configs/train/video_finetune_local.json"}
 
-WORKSPACE=${2:-"workspace/test_debug_local"}
+WORKSPACE=${2:-"workspace/test_debug_local_test_nan"}
 
 accelerate launch \
     --num_processes 1 \

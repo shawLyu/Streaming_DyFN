@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.version
+from torch.cuda.amp import GradScaler
 import accelerate
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
@@ -182,6 +183,10 @@ def main(
                     checkpoint['ema_model'] = torch.load(checkpoint_ema_model_path, map_location='cpu', weights_only=True)['model']
         else:
             checkpoint = None
+
+    if checkpoint is not None:
+        safe_scaler = GradScaler(init_scale=2**8, growth_interval=2000, growth_factor=2.0, backoff_factor=0.5)
+        accelerator.scaler = safe_scaler
 
     if checkpoint is None:
         # Initialize model weights
