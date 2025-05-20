@@ -132,24 +132,14 @@ def main(
     import warnings
     warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
     
-    for name, param in model.backbone.named_parameters():
-        param.requires_grad = False
+    # for name, param in model.backbone.named_parameters():
+    #     param.requires_grad = False
 
     # Initalize optimizer & lr scheduler
     optimizer = build_optimizer(model, config['optimizer'])
     lr_scheduler = build_lr_scheduler(optimizer, config['lr_scheduler'])
 
     count_grouped_parameters = [sum(p.numel() for p in param_group['params'] if p.requires_grad) for param_group in optimizer.param_groups]
-    print("\nParameter counts by layer type:")
-    layer_params = {}
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        print(f"Name: {name}, numel: {param.numel()}")
-
-    for layer_type, count in layer_params.items():
-        print(f"- {layer_type}: {count:,} parameters")
-    print()
     for i, count in enumerate(count_grouped_parameters):
         print(f'- Group {i}: {count} parameters')
 
@@ -327,7 +317,7 @@ def main(
                                                                                                              gt_points[i-sequence_length+1:i+1], 
                                                                                                              gt_mask[i-sequence_length+1:i+1], 
                                                                                                              **v['params'])
-                                    weight_dict['video_' + k] = v['weight']
+                                    weight_dict['video_' + k] = v['weight'] / sequence_length
                             elif v['function'] == 'affine_invariant_local_loss':
                                 loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
                             elif v['function'] == 'normal_loss':

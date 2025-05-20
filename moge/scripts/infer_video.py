@@ -101,7 +101,7 @@ def main(
         depth = np.where((depth > 0) & mask, depth, np.nan)
         disp_preds = 1 / depth
 
-    min_disp, max_disp = np.nanquantile(disp_preds, 0.001), np.nanquantile(disp_preds, 0.99)
+    min_disp, max_disp = np.nanquantile(disp_preds, 0.01), np.nanquantile(disp_preds, 0.99)
     depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp)
 
     if save_video:
