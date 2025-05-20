@@ -264,7 +264,7 @@ class TemporalHead(nn.Module):
 
                     Bh, Dh, Hh, Wh = comp.shape
                     comp = comp.flatten(2).transpose(1, 2)  # (B, N, D)
-                    rope = self.rope(h).unsqueeze(0).expand(B, Hh * Wh, -1)  # (B, N, D)
+                    rope = self.rope(t - h).unsqueeze(0).expand(B, Hh * Wh, -1)  # (B, N, D)
 
                     all_tokens.append(comp)
                     rope_tokens.append(rope)
@@ -593,7 +593,7 @@ class MoGeModel(nn.Module):
             for i in range(len(features)):
                 quary_feature = features[i][0]
                 _, num_tokens, D = quary_feature.shape
-                quary_rope = self.aggregation_layer.rope(len(memory_banks)).unsqueeze(0).expand(1, num_tokens, -1)
+                quary_rope = self.aggregation_layer.rope(0).unsqueeze(0).expand(1, num_tokens, -1)
 
                 context_tokens = []
                 context_rope = []
@@ -601,7 +601,7 @@ class MoGeModel(nn.Module):
                     context_token = memory_banks[j][i].permute(0, 2, 3, 1).reshape(1, -1, D)
                     _, num_context_tokens, _ = context_token.shape
                     context_tokens.append(context_token)
-                    context_rope.append(self.aggregation_layer.rope(j).unsqueeze(0).expand(1, num_context_tokens, -1))
+                    context_rope.append(self.aggregation_layer.rope(len(memory_banks) - j).unsqueeze(0).expand(1, num_context_tokens, -1))
                 context_tokens = torch.cat(context_tokens, dim=1)
                 context_rope = torch.cat(context_rope, dim=1)
 
