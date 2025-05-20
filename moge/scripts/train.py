@@ -197,7 +197,7 @@ def main(
             checkpoint = None
 
     if checkpoint is not None:
-        safe_scaler = GradScaler(init_scale=2**8, growth_interval=100, growth_factor=2.0, backoff_factor=0.5)
+        safe_scaler = GradScaler(init_scale=2**4, growth_interval=100, growth_factor=2.0, backoff_factor=0.5)
         accelerator.scaler = safe_scaler
 
     if checkpoint is None:
@@ -351,6 +351,7 @@ def main(
                         if torch.isnan(loss_).item():
                             pbar.write(f'NaN loss in process {accelerator.process_index}')
                             pbar.write(str(loss_dict))
+                            pbar.write(str(batch['info'][i]))
 
                         misc_dict = {'.'.join(k): v for k, v in flatten_nested_dict(misc_dict).items()}
                         records.append({

@@ -6,7 +6,7 @@ CFG=${1:-"configs/train/video_finetune_local.json"}
 WORKSPACE=${2:-"workspace/test_debug_local_test_nan"}
 
 accelerate launch \
-    --num_processes 1 \
+    --num_processes 2 \
     moge/scripts/train.py \
     --config $CFG \
     --workspace $WORKSPACE \
@@ -17,4 +17,5 @@ accelerate launch \
     --vis_every 500 \
     --enable_mlflow True \
     --enable_mixed_precision True \
-    --save_every 500
+    --save_every 500 \
+    --log_every 100

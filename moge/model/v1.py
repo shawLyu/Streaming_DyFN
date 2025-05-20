@@ -5,6 +5,8 @@ from pathlib import Path
 import importlib
 import warnings
 import json
+
+from tqdm import tqdm
 from einops import rearrange
 
 import torch
@@ -158,7 +160,7 @@ class AttentionBlock(nn.Module):
                 context: torch.Tensor | None = None, rope_q: torch.Tensor | None = None, 
                 rope_k: torch.Tensor | None = None) -> torch.Tensor:
         context = x if context is None else context
-        x = self.attn( x, attn_bias=attn_bias, context=context, rope_q=rope_q, rope_k=rope_k) + x
+        x = self.attn( x, attn_bias=attn_bias, context=context, rope_q=rope_q, rope_k=rope_k ) + x
         return x
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -206,17 +208,17 @@ class TemporalHead(nn.Module):
 
         self.rope = RotaryPositionalEmbedding(hidden_dim, max_len=max_len)
 
-        self.temporal_attention = nn.ModuleList([
-            AttentionBlock(
-                hidden_dim, num_heads=num_heads,
-                expansion=expansion, dropout=dropout,
-                layer_scale=layer_scale,
-            ) for _ in range(4)
-        ])
-        # self.temporal_attention = AttentionBlock(
+        # self.temporal_attention = nn.ModuleList([
+        #     AttentionBlock(
         #         hidden_dim, num_heads=num_heads,
         #         expansion=expansion, dropout=dropout,
-        #         layer_scale=layer_scale,)
+        #         layer_scale=layer_scale,
+        #     ) for _ in range(4)
+        # ])
+        self.temporal_attention = AttentionBlock(
+                hidden_dim, num_heads=num_heads,
+                expansion=expansion, dropout=dropout,
+                layer_scale=layer_scale,)
 
     def get_kernel_key(self, t):
         if t <= 1:
@@ -231,7 +233,7 @@ class TemporalHead(nn.Module):
             return "k16"
 
 
-    def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, sequence_length: int = 24):
+    def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, sequence_length: int = 12):
         """
         feat_seq: (B*T, H*W, D)
         Returns: same shape (B*T, H*W, D)
@@ -277,7 +279,7 @@ class TemporalHead(nn.Module):
                     quary_tokens = all_tokens[-1]
                     rope_quary = rope_tokens[-1]
 
-                    x = self.temporal_attention[i](quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
+                    x = self.temporal_attention(quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
                     outputs.append(x)
 
             outputs = torch.cat(outputs, dim=0)
@@ -522,7 +524,7 @@ class MoGeModel(nn.Module):
             raise ValueError(f"Invalid remap output type: {self.remap_output}")
         return points
 
-    def forward(self, image: torch.Tensor, num_tokens: int) -> Dict[str, torch.Tensor]:
+    def forward(self, image: torch.Tensor, num_tokens: int, num_frames: int = 12) -> Dict[str, torch.Tensor]:
         original_height, original_width = image.shape[-2:]
         
         # Resize to expected resolution defined by num_tokens
@@ -537,7 +539,8 @@ class MoGeModel(nn.Module):
         # Get intermediate layers from the backbone
         features = self.backbone.get_intermediate_layers(image_14, self.intermediate_layers, return_class_token=True)
 
-        features = self.aggregation_layer(features, image)
+        if self.training or num_frames != 1:
+            features = self.aggregation_layer(features, image, num_frames)
 
         # Predict points (and mask)
         output = self.head(features, image)
@@ -555,6 +558,75 @@ class MoGeModel(nn.Module):
 
         return_dict = {'points': points, 'mask': mask}
         return return_dict
+
+    def forward_video(self, image: torch.Tensor, num_tokens: int, memory_banks: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        original_height, original_width = image.shape[-2:]
+        
+        # Resize to expected resolution defined by num_tokens
+        resize_factor = ((num_tokens * 14 ** 2) / (original_height * original_width)) ** 0.5
+        resized_width, resized_height = int(original_width * resize_factor), int(original_height * resize_factor)
+        image = F.interpolate(image, (resized_height, resized_width), mode="bicubic", align_corners=False, antialias=True)
+    
+        # Apply image transformation for DINOv2
+        image = (image - self.image_mean) / self.image_std
+        image_14 = F.interpolate(image, (resized_height // 14 * 14, resized_width // 14 * 14), mode="bilinear", align_corners=False, antialias=True)
+
+
+        img_h, img_w = image.shape[-2:]
+        patch_h, patch_w = img_h // 14, img_w // 14
+        # Get intermediate layers from the backbone
+        # features[0][0].shape: (B, patch_h*patch_w, D)
+        features = self.backbone.get_intermediate_layers(image_14, self.intermediate_layers, return_class_token=True)
+        if len(memory_banks) > 0:
+
+            # Update the memory banks
+            for i , memory_cache in enumerate(memory_banks):
+                time_gap = len(memory_banks) - i
+
+                # memory_cache should be the [B, D, H, W]
+                if time_gap in [2, 5, 9, 17]:
+                    for j in range(len(memory_cache)):
+                        memory_cache[j] = self.aggregation_layer.compressors["k2"](memory_cache[j])
+                memory_banks[i] = memory_cache
+
+            features = list(features)
+            for i in range(len(features)):
+                quary_feature = features[i][0]
+                _, num_tokens, D = quary_feature.shape
+                quary_rope = self.aggregation_layer.rope(len(memory_banks)).unsqueeze(0).expand(1, num_tokens, -1)
+
+                context_tokens = []
+                context_rope = []
+                for j in range(len(memory_banks)):
+                    context_token = memory_banks[j][i].permute(0, 2, 3, 1).reshape(1, -1, D)
+                    _, num_context_tokens, _ = context_token.shape
+                    context_tokens.append(context_token)
+                    context_rope.append(self.aggregation_layer.rope(j).unsqueeze(0).expand(1, num_context_tokens, -1))
+                context_tokens = torch.cat(context_tokens, dim=1)
+                context_rope = torch.cat(context_rope, dim=1)
+
+                x = self.aggregation_layer.temporal_attention(quary_feature, context=context_tokens, rope_q=quary_rope, rope_k=context_rope)
+                features[i] = (x, features[i][1])
+
+            features = tuple(features)
+
+        output = self.head(features, image)
+        points, mask = output
+        
+        # Make sure fp32 precision for output
+        with torch.autocast(device_type=image.device.type, dtype=torch.float32):
+            # Resize to original resolution
+            points = F.interpolate(points, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
+            mask = F.interpolate(mask, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
+            
+            # Post-process points and mask
+            points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
+            points = self._remap_points(points)     # slightly improves the performance in case of very large output values
+
+        return_dict = {'points': points, 'mask': mask}
+
+        memory_cache = [features[i][0].reshape(1, patch_h, patch_w, -1).permute(0, 3, 1, 2) for i in range(len(features))]
+        return return_dict, memory_cache
 
     @torch.inference_mode()
     def infer(
@@ -592,7 +664,9 @@ class MoGeModel(nn.Module):
         if image.dim() == 3:
             omit_batch_dim = True
             image = image.unsqueeze(0)
+            num_frames = None
         else:
+            num_frames = image.shape[0]
             omit_batch_dim = False
 
         original_height, original_width = image.shape[-2:]
@@ -603,43 +677,68 @@ class MoGeModel(nn.Module):
             min_tokens, max_tokens = self.num_tokens_range
             num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
         
+        outputs = []
         with torch.autocast(device_type=image.device.type, dtype=torch.float16, enabled=use_fp16):
-            output = self.forward(image, num_tokens)
-        points, mask = output['points'], output['mask']
+            if omit_batch_dim:
+                output = self.forward(image, num_tokens, 1)
+                outputs.append(output)
+            else:
+                memory_banks = []
+                for i in tqdm(range(num_frames), desc="Processing video frames"):
+                    output, current_features = self.forward_video(image[i][None, ...], num_tokens, memory_banks)
+                    memory_banks.append(current_features)
+                    outputs.append(output)
 
-        mask_binary = mask > self.mask_threshold
+        point_list, intrinsics_list, depth_list, mask_binary_list, mask_list = [], [], [], [], []
+        for output in outputs:
+            points, mask = output['points'], output['mask']
 
-        # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
-        if fov_x is None:
-            focal, shift = recover_focal_shift(points, mask_binary)
-        else:
-            focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
-            if focal.ndim == 0:
-                focal = focal[None].expand(points.shape[0])
-            _, shift = recover_focal_shift(points, mask_binary, focal=focal)
-        fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
-        fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
-        intrinsics = utils3d.torch.intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
-        depth = points[..., 2] + shift[..., None, None]
-        
-        # If projection constraint is forced, recompute the point map using the actual depth map
-        if force_projection:
-            points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
-        else:
-            points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
+            mask_binary = mask > self.mask_threshold
 
-        # Apply mask if needed
-        if apply_mask:
-            points = torch.where(mask_binary[..., None], points, torch.inf)
-            depth = torch.where(mask_binary, depth, torch.inf)
+            # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
+            if fov_x is None:
+                focal, shift = recover_focal_shift(points, mask_binary)
+            else:
+                focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
+                if focal.ndim == 0:
+                    focal = focal[None].expand(points.shape[0])
+                _, shift = recover_focal_shift(points, mask_binary, focal=focal)
+            fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
+            fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
+            intrinsics = utils3d.torch.intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
+            depth = points[..., 2] + shift[..., None, None]
 
-        if omit_batch_dim:
-            points = points.squeeze(0)
-            intrinsics = intrinsics.squeeze(0)
-            depth = depth.squeeze(0)
-            mask_binary = mask_binary.squeeze(0)
-            mask = mask.squeeze(0)
+            fov_x = 2 * torch.rad2deg(torch.atan(aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / focal))
+            
+            # If projection constraint is forced, recompute the point map using the actual depth map
+            if force_projection:
+                points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
+            else:
+                points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
 
+            # Apply mask if needed
+            if apply_mask:
+                points = torch.where(mask_binary[..., None], points, torch.inf)
+                depth = torch.where(mask_binary, depth, torch.inf)
+
+            if omit_batch_dim:
+                points = points.squeeze(0)
+                intrinsics = intrinsics.squeeze(0)
+                depth = depth.squeeze(0)
+                mask_binary = mask_binary.squeeze(0)
+                mask = mask.squeeze(0)
+            else:
+                point_list.append(points)
+                intrinsics_list.append(intrinsics)
+                depth_list.append(depth)
+                mask_binary_list.append(mask_binary)
+                mask_list.append(mask)
+        if not omit_batch_dim:
+            points = torch.cat(point_list, dim=0)
+            intrinsics = torch.cat(intrinsics_list, dim=0)
+            depth = torch.cat(depth_list, dim=0)
+            mask_binary = torch.cat(mask_binary_list, dim=0)
+            mask = torch.cat(mask_list, dim=0)
         return_dict = {
             'points': points,
             'intrinsics': intrinsics,
