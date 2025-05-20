@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.version
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 import accelerate
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
@@ -51,7 +51,6 @@ from moge.test.metrics import compute_metrics
 @click.option('--workspace', type=str, default='workspace/debug', help='Path to the workspace')
 @click.option('--checkpoint', 'checkpoint_path', type=str, default=None, help='Path to the checkpoint to load')
 @click.option('--batch_size_forward', type=int, default=8, help='Batch size for each forward pass on each device')
-@click.option('--sequence_length', type=int, default=3, help='Number of sequences to train on')
 @click.option('--gradient_accumulation_steps', type=int, default=1, help='Number of steps to accumulate gradients')
 @click.option('--enable_gradient_checkpointing', type=bool, default=True, help='Use gradient checkpointing in backbone')
 @click.option('--enable_mixed_precision', type=bool, default=False, help='Use mixed precision training. Backbone is converted to FP16')
@@ -68,7 +67,6 @@ def main(
     workspace: str,
     checkpoint_path: str,
     batch_size_forward: int,
-    sequence_length: int,
     gradient_accumulation_steps: int,
     enable_gradient_checkpointing: bool,
     enable_mixed_precision: bool,
@@ -94,6 +92,7 @@ def main(
     )
     device = accelerator.device
     batch_size_total = batch_size_forward * gradient_accumulation_steps * accelerator.num_processes
+    sequence_length = config['data']['sampled_sequence_length']
 
     # Log config
     if accelerator.is_main_process:
@@ -133,11 +132,24 @@ def main(
     import warnings
     warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
     
+    for name, param in model.backbone.named_parameters():
+        param.requires_grad = False
+
     # Initalize optimizer & lr scheduler
     optimizer = build_optimizer(model, config['optimizer'])
     lr_scheduler = build_lr_scheduler(optimizer, config['lr_scheduler'])
 
     count_grouped_parameters = [sum(p.numel() for p in param_group['params'] if p.requires_grad) for param_group in optimizer.param_groups]
+    print("\nParameter counts by layer type:")
+    layer_params = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        print(f"Name: {name}, numel: {param.numel()}")
+
+    for layer_type, count in layer_params.items():
+        print(f"- {layer_type}: {count:,} parameters")
+    print()
     for i, count in enumerate(count_grouped_parameters):
         print(f'- Group {i}: {count} parameters')
 

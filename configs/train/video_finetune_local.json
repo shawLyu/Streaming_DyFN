@@ -7,6 +7,7 @@
         "fov_range_absolute": [30, 150],
         "fov_range_relative": [0.5, 1.0],
         "image_augmentation": ["jittering", "jpeg_loss", "blurring"],
+        "sampled_sequence_length": 24,
         "datasets": [ 
            {
                 "name": "Hypersim",
@@ -104,21 +105,20 @@
         "type": "AdamW",
         "params": [
             {"params": {"include": ["*aggregation_layer.*"], "lr": 5e-6}},
-            {"params": {"include": ["*"], "exclude": ["*aggregation_layer.*", "*backbone.*"]}, "lr": 1e-6},
-            {"params": {"include": ["*backbone.*"]}, "lr": 1e-7}
+            {"params": {"include": ["*"], "exclude": ["*aggregation_layer.*", "*backbone.*"]}, "lr": 1e-6}
         ]
     },
     "lr_scheduler": {
         "type": "SequentialLR",
         "params": {
             "schedulers": [
-                {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "1.0", "max(0.0, min(1.0, (epoch - 100) / 100))"]}},
+                {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "1.0"]}},
                 {"type": "StepLR", "params": {"step_size": 5000, "gamma": 0.5}}
             ],
             "milestones": [1000]
         }
     },
-    "low_resolution_training_steps": 1000,
+    "low_resolution_training_steps": 10000,
     "loss": {
         "invalid": {},
         "synthetic": {

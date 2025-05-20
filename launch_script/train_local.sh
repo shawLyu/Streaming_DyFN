@@ -12,7 +12,7 @@ accelerate launch \
     --workspace $WORKSPACE \
     --checkpoint pretrained_moge/image_pretrained_moge.pt \
     --gradient_accumulation_steps 1 \
-    --batch_size_forward 4 \
+    --batch_size_forward 1 \
     --enable_gradient_checkpointing False \
     --vis_every 500 \
     --enable_mlflow True \

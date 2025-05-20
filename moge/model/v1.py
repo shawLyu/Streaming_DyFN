@@ -109,7 +109,7 @@ class AttentionBlock(nn.Module):
     def __init__(
         self,
         dim: int,
-        num_heads: int = 4,
+        num_heads: int = 1,
         expansion: int = 4,
         dropout: float = 0.0,
         cosine: bool = False,
@@ -122,101 +122,168 @@ class AttentionBlock(nn.Module):
         self.num_heads = num_heads
         self.hidden_dim = dim
         context_dim = context_dim or dim
-        self.mlp = MLP(dim, expansion=expansion, dropout=dropout, gated=gated)
         self.kv = nn.Linear(context_dim, dim * 2)
         self.q = nn.Linear(dim, dim)
         self.norm_attnx = nn.LayerNorm(dim)
         self.norm_attnctx = nn.LayerNorm(context_dim)
         self.cosine = cosine
         self.out = nn.Linear(dim, dim)
-        self.ls1 = LayerScale(dim, layer_scale) if layer_scale > 0.0 else nn.Identity()
-        self.ls2 = LayerScale(dim, layer_scale) if layer_scale > 0.0 else nn.Identity()
 
-    def attn( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, context: torch.Tensor | None = None, is_causal: bool = False) -> torch.Tensor:
+    def attn( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, 
+             context: torch.Tensor | None = None, rope_q: torch.Tensor | None = None, 
+             rope_k: torch.Tensor | None = None, token_lens: List[int] | None = None) -> torch.Tensor:
         x = self.norm_attnx(x)
         context = self.norm_attnctx(context)
         k, v = rearrange(self.kv(context), "b n (kv h d) -> b h n d kv", h=self.num_heads, kv=2).unbind(dim=-1)
         q = rearrange(self.q(x), "b n (h d) -> b h n d", h=self.num_heads)
 
-        if self.cosine:
-            q, k = map(partial(F.normalize, p=2, dim=-1), (q, k))  # cosine sim
+        # if self.cosine:
+        #     q, k = map(partial(F.normalize, p=2, dim=-1), (q, k))  # cosine sim
+        
+        if rope_q is not None and rope_k is not None:
+            q = self.apply_rope(q, rope_q.unsqueeze(1))
+            k = self.apply_rope(k, rope_k.unsqueeze(1))
 
-        # if is_causal:
-        #     x = F.scaled_dot_product_attention( q, k, v, dropout_p=self.dropout, is_causal=is_causal )
-        # else:
         x = F.scaled_dot_product_attention( q, k, v, dropout_p=self.dropout)
         x = rearrange(x, "b h n d -> b n (h d)")
         x = self.out(x)
         return x
 
-    def forward( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, context: torch.Tensor | None = None, is_causal: bool = False) -> torch.Tensor:
+    def apply_rope(self, x, rope):
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        r1, r2 = rope[..., ::2], rope[..., 1::2]
+        return torch.cat([x1 * r2 + x2 * r1, x2 * r2 - x1 * r1], dim=-1)
+
+    def forward( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, 
+                context: torch.Tensor | None = None, rope_q: torch.Tensor | None = None, 
+                rope_k: torch.Tensor | None = None) -> torch.Tensor:
         context = x if context is None else context
-        x = self.ls1(self.attn( x, attn_bias=attn_bias, context=context, is_causal=is_causal)) + x
-        x = self.ls2(self.mlp(x)) + x
+        x = self.attn( x, attn_bias=attn_bias, context=context, rope_q=rope_q, rope_k=rope_k) + x
         return x
 
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, dim, max_len=2048):
+        super().__init__()
+        freqs = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_len).float()
+        freqs = torch.outer(t, freqs)
+        emb = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
+        self.register_buffer('emb', emb)
+
+    def forward(self, start_idx):
+        return self.emb[start_idx]  # (seq_len, dim)
+
+    def downsample(self, rope_emb, factor):
+        pooled = rope_emb.unfold(0, factor, factor).mean(dim=-1)
+        return pooled  # (seq_len // factor, dim)
+
+# class PatchCompressor(nn.Module):
+#     def __init__(self, in_dim, out_dim, kernel_size):
+#         super().__init__()
+#         self.conv = nn.Conv2d(in_dim, out_dim, kernel_size=kernel_size, stride=kernel_size)
+
+#     def forward(self, feat):  # feat: (B, D, H, W)
+#         return self.conv(feat)  # (B, D, H', W')
+
 class TemporalHead(nn.Module):
-    def __init__(self, num_frames: int, 
-                 hidden_dim: int, 
-                 num_heads: int = 8, 
-                 expansion: int = 4, 
-                 dropout: float = 0.0, 
-                 layer_scale: float = 1.0):
+    def __init__(self, hidden_dim, num_heads=8, expansion=4, dropout=0.0, layer_scale=1.0, max_len=1024):
         super().__init__()
 
-        self.num_frames = num_frames
-        # temporal embedding
-        self.temporal_embed = nn.Parameter(torch.randn(num_frames, hidden_dim), requires_grad=True)
-        self.temporal_embed_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim),
-        )
+        double_x_compressor = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=2, stride=2)
+        self.compressors = nn.ModuleDict({
+            "k1": nn.Identity(),
+            "k2": double_x_compressor,
+            "k4": nn.Sequential(
+                double_x_compressor, double_x_compressor,
+            ),
+            "k8": nn.Sequential(
+                double_x_compressor, double_x_compressor, double_x_compressor,
+            ),
+            "k16": nn.Sequential(
+                double_x_compressor, double_x_compressor, double_x_compressor, double_x_compressor,
+            ),
+        })
+
+        self.rope = RotaryPositionalEmbedding(hidden_dim, max_len=max_len)
 
         self.temporal_attention = nn.ModuleList([
             AttentionBlock(
-                hidden_dim, num_heads=num_heads, expansion=expansion, 
-                dropout=dropout, layer_scale=layer_scale,
+                hidden_dim, num_heads=num_heads,
+                expansion=expansion, dropout=dropout,
+                layer_scale=layer_scale,
             ) for _ in range(4)
         ])
+        # self.temporal_attention = AttentionBlock(
+        #         hidden_dim, num_heads=num_heads,
+        #         expansion=expansion, dropout=dropout,
+        #         layer_scale=layer_scale,)
 
-    def build_random_frame_mask(self, B, T, device, p=0.5):
-        # mask: True indicates no attention
-        mask = torch.rand(B, T, T, device=device) < p
-        for b in range(B):
-            mask[b].fill_diagonal_(True)  # allow self-attention
-        return mask  # (B, T, T)
+    def get_kernel_key(self, t):
+        if t <= 1:
+            return "k1"
+        elif t <= 4:
+            return "k2"
+        elif t <= 8:
+            return "k4"
+        elif t <= 16:
+            return "k8"
+        else:
+            return "k16"
 
-    def forward(self, features: torch.Tensor, image: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
+
+    def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, sequence_length: int = 24):
+        """
+        feat_seq: (B*T, H*W, D)
+        Returns: same shape (B*T, H*W, D)
+        """
         img_h, img_w = image.shape[-2:]
         patch_h, patch_w = img_h // 14, img_w // 14
+        B = image.shape[0] // sequence_length
 
-        # (B, D, H, W)
-        x_feat = torch.stack([feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous() 
-                         for feat, clstoken in features ], dim=1).permute(0, 1, 3, 4, 2)
-        BT, num_features, _, _, D = x_feat.shape
+        features = [hidden_states[i][0].reshape(B, sequence_length, patch_h * patch_w, -1) for i in range(len(hidden_states))] # each feature is (B, sequence_length, patch_h * patch_w, D)
 
-        if self.training and not is_causal:
-            mask = self.build_random_frame_mask(BT//self.num_frames, self.num_frames, x_feat.device, p=0.5)
-            mask = mask.repeat_interleave(patch_h * patch_w, dim=0)
-        else:
-            # Build causal mask for inference - each frame can only attend to previous frames
-            mask = torch.ones(BT//self.num_frames, self.num_frames, self.num_frames, device=x_feat.device, dtype=torch.bool)
-            mask = torch.triu(mask, diagonal=1).bool().logical_not()  # Upper triangular matrix with 1s above diagonal
-            mask = mask.repeat_interleave(patch_h * patch_w, dim=0)  # Expand mask for patches
+        D = features[0].shape[-1]
 
-        x_feat = torch.chunk(x_feat, num_features, dim=1)
-        temporal_embed = self.temporal_embed_layer(self.temporal_embed)
+        hidden_states = list(hidden_states)
+        for i, feature_i in enumerate(features):
+            outputs = []
+            for t in range(sequence_length):
+                all_tokens = []
+                rope_tokens = []
+                token_lens = []
 
-        features = list(features)
-        for i in range(len(x_feat)):
-            encoded_feature_i = x_feat[i].reshape(BT//self.num_frames, self.num_frames, patch_h, patch_w, D)
-            encoded_feature_i = rearrange(encoded_feature_i, "b t h w c -> (b h w) t c", h=patch_h, w=patch_w)
-            encoded_feature_i = encoded_feature_i + temporal_embed.unsqueeze(0).repeat(BT//self.num_frames*patch_h*patch_w, 1, 1)
-            encoded_feature_i = self.temporal_attention[i](encoded_feature_i, attn_bias=mask.unsqueeze(1) if mask is not None else None, is_causal=is_causal)
-            encoded_feature_i = rearrange(encoded_feature_i, "(b h w) t c -> (b t) (h w) c", h=patch_h, w=patch_w, t=self.num_frames, c=D)
-            features[i] = (encoded_feature_i, features[i][1])
+                for h in range(t + 1):
+                    key = self.get_kernel_key(t - h)
+                    feat = feature_i[:, h].reshape(B, patch_h, patch_w, -1).permute(0, 3, 1, 2)  # (B, D, H, W)
+                    if isinstance(self.compressors[key], nn.Identity):
+                        comp = feat
+                    else:
+                        comp = self.compressors[key](feat)  # (B, D, H', W')
 
-        return tuple(features)
+                    Bh, Dh, Hh, Wh = comp.shape
+                    comp = comp.flatten(2).transpose(1, 2)  # (B, N, D)
+                    rope = self.rope(h).unsqueeze(0).expand(B, Hh * Wh, -1)  # (B, N, D)
+
+                    all_tokens.append(comp)
+                    rope_tokens.append(rope)
+                    token_lens.append(comp.shape[1])
+
+                if t == 0:
+                    outputs.append(all_tokens[0])
+                else:
+                    context_tokens = torch.cat(all_tokens[:-1], dim=1)         # (B, total, D)
+                    rope_context = torch.cat(rope_tokens[:-1], dim=1)  # (B, total, D)
+
+                    quary_tokens = all_tokens[-1]
+                    rope_quary = rope_tokens[-1]
+
+                    x = self.temporal_attention[i](quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
+                    outputs.append(x)
+
+            outputs = torch.cat(outputs, dim=0)
+            hidden_states[i] = (outputs, hidden_states[i][1])
+
+        return tuple(hidden_states)
 
 class Head(nn.Module):
     def __init__(
@@ -345,9 +412,8 @@ class MoGeModel(nn.Module):
 
         # TODO: change the parameters of the aggregation layer
         self.aggregation_layer = TemporalHead(
-            num_frames=3,
             hidden_dim=dim_feature,
-            num_heads=8,
+            num_heads=1,
             expansion=4,
             dropout=0.0,
             layer_scale=1.0,
@@ -471,7 +537,7 @@ class MoGeModel(nn.Module):
         # Get intermediate layers from the backbone
         features = self.backbone.get_intermediate_layers(image_14, self.intermediate_layers, return_class_token=True)
 
-        features = self.aggregation_layer(features, image, is_causal=True)
+        features = self.aggregation_layer(features, image)
 
         # Predict points (and mask)
         output = self.head(features, image)
