@@ -17,6 +17,7 @@ import torch.utils.checkpoint
 import torch.version
 import utils3d
 from huggingface_hub import hf_hub_download
+# from timm.models.layers import trunc_normal_
 
 from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift, gaussian_blur_2d
 from .utils import wrap_dinov2_attention_with_sdpa, wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
@@ -124,12 +125,15 @@ class AttentionBlock(nn.Module):
         self.num_heads = num_heads
         self.hidden_dim = dim
         context_dim = context_dim or dim
+        self.mlp = MLP(dim, expansion=expansion, dropout=dropout, gated=gated)
         self.kv = nn.Linear(context_dim, dim * 2)
         self.q = nn.Linear(dim, dim)
         self.norm_attnx = nn.LayerNorm(dim)
         self.norm_attnctx = nn.LayerNorm(context_dim)
         self.cosine = cosine
         self.out = nn.Linear(dim, dim)
+        self.ls1 = LayerScale(dim, layer_scale) if layer_scale > 0.0 else nn.Identity()
+        self.ls2 = LayerScale(dim, layer_scale) if layer_scale > 0.0 else nn.Identity()
 
     def attn( self, x: torch.Tensor, attn_bias: torch.Tensor | None = None, 
              context: torch.Tensor | None = None, rope_q: torch.Tensor | None = None, 
@@ -160,7 +164,8 @@ class AttentionBlock(nn.Module):
                 context: torch.Tensor | None = None, rope_q: torch.Tensor | None = None, 
                 rope_k: torch.Tensor | None = None) -> torch.Tensor:
         context = x if context is None else context
-        x = self.attn( x, attn_bias=attn_bias, context=context, rope_q=rope_q, rope_k=rope_k ) + x
+        x = self.ls1(self.attn( x, attn_bias=attn_bias, context=context, rope_q=rope_q, rope_k=rope_k ) + x)
+        x = self.ls2(self.mlp(x)) + x
         return x
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -208,20 +213,21 @@ class TemporalHead(nn.Module):
 
         self.rope = RotaryPositionalEmbedding(hidden_dim, max_len=max_len)
 
-        # self.temporal_attention = nn.ModuleList([
-        #     AttentionBlock(
-        #         hidden_dim, num_heads=num_heads,
-        #         expansion=expansion, dropout=dropout,
-        #         layer_scale=layer_scale,
-        #     ) for _ in range(4)
-        # ])
-        self.temporal_attention = AttentionBlock(
+        self.temporal_attention = nn.ModuleList([
+            AttentionBlock(
                 hidden_dim, num_heads=num_heads,
                 expansion=expansion, dropout=dropout,
-                layer_scale=layer_scale,)
+                layer_scale=layer_scale,
+            ) for _ in range(4)
+        ])
+        # self.temporal_attention = AttentionBlock(
+        #         hidden_dim, num_heads=num_heads,
+        #         expansion=expansion, dropout=dropout,
+        #         layer_scale=layer_scale,)
+        # self.apply(self._init_weights)
 
     def get_kernel_key(self, t):
-        if t <= 1:
+        if t <= 2:
             return "k1"
         elif t <= 4:
             return "k2"
@@ -231,6 +237,19 @@ class TemporalHead(nn.Module):
             return "k8"
         else:
             return "k16"
+
+    # def _init_weights(self, m):
+    #     if isinstance(m, nn.Linear):
+    #         trunc_normal_(m.weight, std=0.02)
+    #         if m.bias is not None:
+    #             nn.init.constant_(m.bias, 0)
+    #     elif isinstance(m, nn.Conv2d):
+    #         trunc_normal_(m.weight, std=0.02)
+    #         if m.bias is not None:
+    #             nn.init.constant_(m.bias, 0)
+    #     elif isinstance(m, nn.LayerNorm):
+    #         nn.init.constant_(m.bias, 0)
+    #         nn.init.constant_(m.weight, 1.0)
 
 
     def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, sequence_length: int = 12):
@@ -271,7 +290,7 @@ class TemporalHead(nn.Module):
                     token_lens.append(comp.shape[1])
 
                 if t == 0:
-                    outputs.append(all_tokens[0])
+                    outputs.append(all_tokens[-1])
                 else:
                     context_tokens = torch.cat(all_tokens[:-1], dim=1)         # (B, total, D)
                     rope_context = torch.cat(rope_tokens[:-1], dim=1)  # (B, total, D)
@@ -279,7 +298,10 @@ class TemporalHead(nn.Module):
                     quary_tokens = all_tokens[-1]
                     rope_quary = rope_tokens[-1]
 
-                    x = self.temporal_attention(quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
+                    if isinstance(self.temporal_attention, nn.ModuleList):
+                        x = self.temporal_attention[i](quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
+                    else:
+                        x = self.temporal_attention(quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
                     outputs.append(x)
 
             outputs = torch.cat(outputs, dim=0)
@@ -584,7 +606,7 @@ class MoGeModel(nn.Module):
                 time_gap = len(memory_banks) - i
 
                 # memory_cache should be the [B, D, H, W]
-                if time_gap in [2, 5, 9, 17]:
+                if time_gap in [3, 5, 9, 17]:
                     for j in range(len(memory_cache)):
                         memory_cache[j] = self.aggregation_layer.compressors["k2"](memory_cache[j])
                 memory_banks[i] = memory_cache
@@ -605,7 +627,10 @@ class MoGeModel(nn.Module):
                 context_tokens = torch.cat(context_tokens, dim=1)
                 context_rope = torch.cat(context_rope, dim=1)
 
-                x = self.aggregation_layer.temporal_attention(quary_feature, context=context_tokens, rope_q=quary_rope, rope_k=context_rope)
+                if isinstance(self.aggregation_layer.temporal_attention, nn.ModuleList):
+                    x = self.aggregation_layer.temporal_attention[i](quary_feature, context=context_tokens, rope_q=quary_rope, rope_k=context_rope)
+                else:
+                    x = self.aggregation_layer.temporal_attention(quary_feature, context=context_tokens, rope_q=quary_rope, rope_k=context_rope)
                 features[i] = (x, features[i][1])
 
             features = tuple(features)

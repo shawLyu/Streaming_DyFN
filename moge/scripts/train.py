@@ -317,7 +317,7 @@ def main(
                                                                                                              gt_points[i-sequence_length+1:i+1], 
                                                                                                              gt_mask[i-sequence_length+1:i+1], 
                                                                                                              **v['params'])
-                                    weight_dict['video_' + k] = v['weight'] / sequence_length
+                                    weight_dict['video_' + k] = v['weight']
                             elif v['function'] == 'affine_invariant_local_loss':
                                 loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
                             elif v['function'] == 'normal_loss':
