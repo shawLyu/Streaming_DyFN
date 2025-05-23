@@ -104,8 +104,8 @@
     "optimizer": {
         "type": "AdamW",
         "params": [
-            {"params": {"include": ["*aggregation_layer.*"], "lr": 1e-4}},
-            {"params": {"include": ["*"], "exclude": ["*aggregation_layer.*", "*backbone.*"]}, "lr": 1e-6},
+            {"params": {"include": ["*temporal_attention.*"], "lr": 1e-4}},
+            {"params": {"include": ["*"], "exclude": ["*temporal_attention.*", "*backbone.*"]}, "lr": 1e-6},
             {"params": {"include": ["*backbone.*"]}, "lr": 5e-7}
         ]
     },
@@ -138,7 +138,8 @@
         },
         "lidar": {
             "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
-            "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}}
+            "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
+            "mask": {"function": "mask_l2_loss", "weight": 1.0}
         }
     }
 }

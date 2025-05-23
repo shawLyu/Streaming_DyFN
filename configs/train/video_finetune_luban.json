@@ -104,8 +104,8 @@
     "optimizer": {
         "type": "AdamW",
         "params": [
-            {"params": {"include": ["*aggregation_layer.*"], "lr": 1e-4}},
-            {"params": {"include": ["*"], "exclude": ["*aggregation_layer.*", "*backbone.*"]}, "lr": 1e-6},
+            {"params": {"include": ["*temporal_attention.*"], "lr": 1e-4}},
+            {"params": {"include": ["*"], "exclude": ["*temporal_attention.*", "*backbone.*"]}, "lr": 1e-6},
             {"params": {"include": ["*backbone.*"]}, "lr": 5e-7}
         ]
     },
