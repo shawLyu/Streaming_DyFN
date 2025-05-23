@@ -177,80 +177,23 @@ class RotaryPositionalEmbedding(nn.Module):
         emb = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         self.register_buffer('emb', emb)
 
-    def forward(self, start_idx):
-        return self.emb[start_idx]  # (seq_len, dim)
+    def forward(self, time_idx):
+        return self.emb[time_idx]  # (seq_len, dim)
 
     def downsample(self, rope_emb, factor):
         pooled = rope_emb.unfold(0, factor, factor).mean(dim=-1)
         return pooled  # (seq_len // factor, dim)
 
-# class PatchCompressor(nn.Module):
-#     def __init__(self, in_dim, out_dim, kernel_size):
-#         super().__init__()
-#         self.conv = nn.Conv2d(in_dim, out_dim, kernel_size=kernel_size, stride=kernel_size)
-
-#     def forward(self, feat):  # feat: (B, D, H, W)
-#         return self.conv(feat)  # (B, D, H', W')
-
 class TemporalHead(nn.Module):
     def __init__(self, hidden_dim, num_heads=8, expansion=4, dropout=0.0, layer_scale=1.0, max_len=1024):
         super().__init__()
 
-        double_x_compressor = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=2, stride=2)
-        self.compressors = nn.ModuleDict({
-            "k1": nn.Identity(),
-            "k2": double_x_compressor,
-            "k4": nn.Sequential(
-                double_x_compressor, double_x_compressor,
-            ),
-            "k8": nn.Sequential(
-                double_x_compressor, double_x_compressor, double_x_compressor,
-            ),
-            "k16": nn.Sequential(
-                double_x_compressor, double_x_compressor, double_x_compressor, double_x_compressor,
-            ),
-        })
-
         self.rope = RotaryPositionalEmbedding(hidden_dim, max_len=max_len)
 
-        self.temporal_attention = nn.ModuleList([
-            AttentionBlock(
+        self.temporal_attention = AttentionBlock(
                 hidden_dim, num_heads=num_heads,
                 expansion=expansion, dropout=dropout,
-                layer_scale=layer_scale,
-            ) for _ in range(4)
-        ])
-        # self.temporal_attention = AttentionBlock(
-        #         hidden_dim, num_heads=num_heads,
-        #         expansion=expansion, dropout=dropout,
-        #         layer_scale=layer_scale,)
-        # self.apply(self._init_weights)
-
-    def get_kernel_key(self, t):
-        if t <= 2:
-            return "k1"
-        elif t <= 4:
-            return "k2"
-        elif t <= 8:
-            return "k4"
-        elif t <= 16:
-            return "k8"
-        else:
-            return "k16"
-
-    # def _init_weights(self, m):
-    #     if isinstance(m, nn.Linear):
-    #         trunc_normal_(m.weight, std=0.02)
-    #         if m.bias is not None:
-    #             nn.init.constant_(m.bias, 0)
-    #     elif isinstance(m, nn.Conv2d):
-    #         trunc_normal_(m.weight, std=0.02)
-    #         if m.bias is not None:
-    #             nn.init.constant_(m.bias, 0)
-    #     elif isinstance(m, nn.LayerNorm):
-    #         nn.init.constant_(m.bias, 0)
-    #         nn.init.constant_(m.weight, 1.0)
-
+                layer_scale=layer_scale,)
 
     def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, sequence_length: int = 12):
         """
@@ -260,54 +203,40 @@ class TemporalHead(nn.Module):
         img_h, img_w = image.shape[-2:]
         patch_h, patch_w = img_h // 14, img_w // 14
         B = image.shape[0] // sequence_length
+        D = hidden_states.shape[1] # (B*T, D, H, W)
+        hidden_states = hidden_states.reshape(B, sequence_length, D, patch_h, patch_w)
 
-        features = [hidden_states[i][0].reshape(B, sequence_length, patch_h * patch_w, -1) for i in range(len(hidden_states))] # each feature is (B, sequence_length, patch_h * patch_w, D)
+        updated_x = []
+        for t in range(sequence_length):
+            all_tokens = []
+            rope_tokens = []
 
-        D = features[0].shape[-1]
-
-        hidden_states = list(hidden_states)
-        for i, feature_i in enumerate(features):
-            outputs = []
-            for t in range(sequence_length):
-                all_tokens = []
-                rope_tokens = []
-                token_lens = []
-
-                for h in range(t + 1):
-                    key = self.get_kernel_key(t - h)
-                    feat = feature_i[:, h].reshape(B, patch_h, patch_w, -1).permute(0, 3, 1, 2)  # (B, D, H, W)
-                    if isinstance(self.compressors[key], nn.Identity):
-                        comp = feat
-                    else:
-                        comp = self.compressors[key](feat)  # (B, D, H', W')
-
-                    Bh, Dh, Hh, Wh = comp.shape
-                    comp = comp.flatten(2).transpose(1, 2)  # (B, N, D)
-                    rope = self.rope(t - h).unsqueeze(0).expand(B, Hh * Wh, -1)  # (B, N, D)
-
-                    all_tokens.append(comp)
-                    rope_tokens.append(rope)
-                    token_lens.append(comp.shape[1])
-
-                if t == 0:
-                    outputs.append(all_tokens[-1])
+            for h in range(t + 1):
+                feat = hidden_states[:, h, ...] # (B, D, H, W)
+                if (t - h) <= 2:
+                    comp = feat
                 else:
-                    context_tokens = torch.cat(all_tokens[:-1], dim=1)         # (B, total, D)
-                    rope_context = torch.cat(rope_tokens[:-1], dim=1)  # (B, total, D)
+                    comp = feat.mean(dim=(-2, -1)).reshape(B, D, 1, 1)
+                Bh, Dh, Hh, Wh = comp.shape
+                comp = comp.flatten(2).transpose(1, 2)  # (B, N, D)
+                rope = self.rope(t - h).unsqueeze(0).expand(B, Hh * Wh, -1)  # (B, N, D)
 
-                    quary_tokens = all_tokens[-1]
-                    rope_quary = rope_tokens[-1]
+                all_tokens.append(comp)
+                rope_tokens.append(rope)
 
-                    if isinstance(self.temporal_attention, nn.ModuleList):
-                        x = self.temporal_attention[i](quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
-                    else:
-                        x = self.temporal_attention(quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
-                    outputs.append(x)
+            if t == 0:
+                updated_x.append(all_tokens[-1].reshape(B, patch_h, patch_w, D).permute(0, 3, 1, 2))
+            else:
+                context_tokens = torch.cat(all_tokens[:-1], dim=1)         # (B, total, D)
+                rope_context = torch.cat(rope_tokens[:-1], dim=1)  # (B, total, D)
 
-            outputs = torch.cat(outputs, dim=0)
-            hidden_states[i] = (outputs, hidden_states[i][1])
+                quary_tokens = all_tokens[-1]
+                rope_quary = rope_tokens[-1]
 
-        return tuple(hidden_states)
+                x = self.temporal_attention(quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
+                updated_x.append(x.reshape(B, patch_h, patch_w, D).permute(0, 3, 1, 2))
+
+        return torch.cat(updated_x, dim=0)
 
 class Head(nn.Module):
     def __init__(
@@ -329,6 +258,10 @@ class Head(nn.Module):
         self.projects = nn.ModuleList([
             nn.Conv2d(in_channels=dim_in, out_channels=dim_proj, kernel_size=1, stride=1, padding=0,) for _ in range(num_features)
         ])
+
+        self.temporal_attention = TemporalHead(
+            hidden_dim=dim_proj, num_heads=1, expansion=4, dropout=0.0, layer_scale=1.0,
+        )
 
         self.upsample_blocks = nn.ModuleList([
             nn.Sequential(
@@ -358,8 +291,8 @@ class Head(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(last_conv_channels, dim_out, kernel_size=last_conv_size, stride=1, padding=last_conv_size // 2, padding_mode='replicate'),
         )
-            
-    def forward(self, hidden_states: torch.Tensor, image: torch.Tensor):
+    
+    def forward_with_memory(self, hidden_states: torch.Tensor, image: torch.Tensor, memory_banks: List[torch.Tensor]):
         img_h, img_w = image.shape[-2:]
         patch_h, patch_w = img_h // 14, img_w // 14
 
@@ -368,7 +301,73 @@ class Head(nn.Module):
             proj(feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous())
                 for proj, (feat, clstoken) in zip(self.projects, hidden_states)
         ], dim=1).sum(dim=1)
+
+        # update memory feature
+        if len(memory_banks) > 0:
+            quary_feature = x
+            _, D, patch_h, patch_w = quary_feature.shape
+            # Update the memory banks
+            for i , memory_cache in enumerate(memory_banks):
+                time_gap = len(memory_banks) - i
+                # memory_cache should be the [B, D, H, W]
+                if time_gap == 3:
+                    memory_cache = memory_cache.mean(dim=(-2, -1)).reshape(1, D, 1, 1)
+
+            quary_rope = self.temporal_attention.rope(0).unsqueeze(0).expand(1, patch_h * patch_w, -1)
+
+            context_tokens = []
+            context_rope = []
+            for j in range(len(memory_banks)):
+                context_token = memory_banks[j].permute(0, 2, 3, 1).reshape(1, -1, D)
+                _, num_context_tokens, _ = context_token.shape
+                context_tokens.append(context_token)
+                context_rope.append(self.temporal_attention.rope(len(memory_banks) - j).unsqueeze(0).expand(1, num_context_tokens, -1))
+            context_tokens = torch.cat(context_tokens, dim=1)
+            context_rope = torch.cat(context_rope, dim=1)
+
+            quary_feature = quary_feature.reshape(quary_feature.shape[0], D, -1).permute(0, 2, 1)
+            x = self.temporal_attention.temporal_attention(quary_feature, context=context_tokens, rope_q=quary_rope, rope_k=context_rope)
+            x = x.reshape(x.shape[0], patch_h, patch_w, D).permute(0, 3, 1, 2)
+            memory_banks.append(quary_feature.permute(0, 2, 1).reshape(-1, D, patch_h, patch_w))
+            # memory_banks.append(x)
+        else:
+            memory_banks.append(x)
+
+        # Upsample stage
+        # (patch_h, patch_w) -> (patch_h * 2, patch_w * 2) -> (patch_h * 4, patch_w * 4) -> (patch_h * 8, patch_w * 8)
+        for i, block in enumerate(self.upsample_blocks):
+            # UV coordinates is for awareness of image aspect ratio
+            uv = normalized_view_plane_uv(width=x.shape[-1], height=x.shape[-2], aspect_ratio=img_w / img_h, dtype=x.dtype, device=x.device)
+            uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+            x = torch.cat([x, uv], dim=1)
+            for layer in block:
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
         
+        # (patch_h * 8, patch_w * 8) -> (img_h, img_w)
+        x = F.interpolate(x, (img_h, img_w), mode="bilinear", align_corners=False)
+        uv = normalized_view_plane_uv(width=x.shape[-1], height=x.shape[-2], aspect_ratio=img_w / img_h, dtype=x.dtype, device=x.device)
+        uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+        x = torch.cat([x, uv], dim=1)
+
+        if isinstance(self.output_block, nn.ModuleList):
+            output = [torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False) for block in self.output_block]
+        else:
+            output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
+        
+        return output
+            
+    def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, memory_banks: List[torch.Tensor] = None):
+        img_h, img_w = image.shape[-2:]
+        patch_h, patch_w = img_h // 14, img_w // 14
+
+        # Process the hidden states
+        x = torch.stack([
+            proj(feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous())
+                for proj, (feat, clstoken) in zip(self.projects, hidden_states)
+        ], dim=1).sum(dim=1)
+
+        if self.training:
+            x = self.temporal_attention(x, image)
         # Upsample stage
         # (patch_h, patch_w) -> (patch_h * 2, patch_w * 2) -> (patch_h * 4, patch_w * 4) -> (patch_h * 8, patch_w * 8)
         for i, block in enumerate(self.upsample_blocks):
@@ -433,15 +432,6 @@ class MoGeModel(nn.Module):
         hub_loader = getattr(importlib.import_module(".dinov2.hub.backbones", __package__), encoder)
         self.backbone = hub_loader(pretrained=False)
         dim_feature = self.backbone.blocks[0].attn.qkv.in_features
-
-        # TODO: change the parameters of the aggregation layer
-        self.aggregation_layer = TemporalHead(
-            hidden_dim=dim_feature,
-            num_heads=1,
-            expansion=4,
-            dropout=0.0,
-            layer_scale=1.0,
-        )
 
         self.head = Head(
             num_features=intermediate_layers if isinstance(intermediate_layers, int) else len(intermediate_layers), 
@@ -546,7 +536,7 @@ class MoGeModel(nn.Module):
             raise ValueError(f"Invalid remap output type: {self.remap_output}")
         return points
 
-    def forward(self, image: torch.Tensor, num_tokens: int, num_frames: int = 12) -> Dict[str, torch.Tensor]:
+    def forward(self, image: torch.Tensor, num_tokens: int) -> Dict[str, torch.Tensor]:
         original_height, original_width = image.shape[-2:]
         
         # Resize to expected resolution defined by num_tokens
@@ -560,9 +550,6 @@ class MoGeModel(nn.Module):
 
         # Get intermediate layers from the backbone
         features = self.backbone.get_intermediate_layers(image_14, self.intermediate_layers, return_class_token=True)
-
-        if self.training or num_frames != 1:
-            features = self.aggregation_layer(features, image, num_frames)
 
         # Predict points (and mask)
         output = self.head(features, image)
@@ -577,81 +564,103 @@ class MoGeModel(nn.Module):
             # Post-process points and mask
             points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
             points = self._remap_points(points)     # slightly improves the performance in case of very large output values
-
+        
         return_dict = {'points': points, 'mask': mask}
         return return_dict
 
-    def forward_video(self, image: torch.Tensor, num_tokens: int, memory_banks: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
-        original_height, original_width = image.shape[-2:]
+
+    @torch.inference_mode()
+    def infer_video(self, 
+        image: torch.Tensor, 
+        fov_x: Union[Number, torch.Tensor] = None,
+        resolution_level: int = 9,
+        num_tokens: int = None,
+        apply_mask: bool = True,
+        force_projection: bool = True,
+        use_fp16: bool = True,
+    ) -> Dict[str, torch.Tensor]:
         
+        original_height, original_width = image.shape[-2:]
+        area = original_height * original_width
+        aspect_ratio = original_width / original_height
+
+        if num_tokens is None:
+            min_tokens, max_tokens = self.num_tokens_range
+            num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
+
         # Resize to expected resolution defined by num_tokens
         resize_factor = ((num_tokens * 14 ** 2) / (original_height * original_width)) ** 0.5
         resized_width, resized_height = int(original_width * resize_factor), int(original_height * resize_factor)
         image = F.interpolate(image, (resized_height, resized_width), mode="bicubic", align_corners=False, antialias=True)
-    
         # Apply image transformation for DINOv2
         image = (image - self.image_mean) / self.image_std
         image_14 = F.interpolate(image, (resized_height // 14 * 14, resized_width // 14 * 14), mode="bilinear", align_corners=False, antialias=True)
 
-
         img_h, img_w = image.shape[-2:]
         patch_h, patch_w = img_h // 14, img_w // 14
+
+        memory_banks = []
+        points_list = []
+        masks_list = []
         # Get intermediate layers from the backbone
-        # features[0][0].shape: (B, patch_h*patch_w, D)
-        features = self.backbone.get_intermediate_layers(image_14, self.intermediate_layers, return_class_token=True)
-        if len(memory_banks) > 0:
+        for i in tqdm(range(image_14.shape[0]), desc="Processing frames"):
+            features = self.backbone.get_intermediate_layers(image_14[i][None, ...], self.intermediate_layers, return_class_token=True)
 
-            # Update the memory banks
-            for i , memory_cache in enumerate(memory_banks):
-                time_gap = len(memory_banks) - i
-
-                # memory_cache should be the [B, D, H, W]
-                if time_gap in [3, 5, 9, 17]:
-                    for j in range(len(memory_cache)):
-                        memory_cache[j] = self.aggregation_layer.compressors["k2"](memory_cache[j])
-                memory_banks[i] = memory_cache
-
-            features = list(features)
-            for i in range(len(features)):
-                quary_feature = features[i][0]
-                _, num_tokens, D = quary_feature.shape
-                quary_rope = self.aggregation_layer.rope(0).unsqueeze(0).expand(1, num_tokens, -1)
-
-                context_tokens = []
-                context_rope = []
-                for j in range(len(memory_banks)):
-                    context_token = memory_banks[j][i].permute(0, 2, 3, 1).reshape(1, -1, D)
-                    _, num_context_tokens, _ = context_token.shape
-                    context_tokens.append(context_token)
-                    context_rope.append(self.aggregation_layer.rope(len(memory_banks) - j).unsqueeze(0).expand(1, num_context_tokens, -1))
-                context_tokens = torch.cat(context_tokens, dim=1)
-                context_rope = torch.cat(context_rope, dim=1)
-
-                if isinstance(self.aggregation_layer.temporal_attention, nn.ModuleList):
-                    x = self.aggregation_layer.temporal_attention[i](quary_feature, context=context_tokens, rope_q=quary_rope, rope_k=context_rope)
-                else:
-                    x = self.aggregation_layer.temporal_attention(quary_feature, context=context_tokens, rope_q=quary_rope, rope_k=context_rope)
-                features[i] = (x, features[i][1])
-
-            features = tuple(features)
-
-        output = self.head(features, image)
-        points, mask = output
+            output = self.head.forward_with_memory(features, image, memory_banks)
+            points, mask = output
         
-        # Make sure fp32 precision for output
-        with torch.autocast(device_type=image.device.type, dtype=torch.float32):
-            # Resize to original resolution
-            points = F.interpolate(points, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
-            mask = F.interpolate(mask, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
-            
-            # Post-process points and mask
-            points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
-            points = self._remap_points(points)     # slightly improves the performance in case of very large output values
+            # Make sure fp32 precision for output
+            with torch.autocast(device_type=image.device.type, dtype=torch.float32):
+                # Resize to original resolution
+                points = F.interpolate(points, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
+                mask = F.interpolate(mask, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
+                
+                # Post-process points and mask
+                points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
+                points = self._remap_points(points)     # slightly improves the performance in case of very large output values
+                points_list.append(points)
+                masks_list.append(mask)
+        
+        points = torch.concat(points_list, dim=0)
+        mask = torch.concat(masks_list, dim=0)
 
-        return_dict = {'points': points, 'mask': mask}
+        mask_binary = mask > self.mask_threshold
 
-        memory_cache = [features[i][0].reshape(1, patch_h, patch_w, -1).permute(0, 3, 1, 2) for i in range(len(features))]
-        return return_dict, memory_cache
+        # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
+        if fov_x is None:
+            focal, shift = recover_focal_shift(points, mask_binary)
+            focal = focal.mean(dim=0).expand(points.shape[0])
+            shift = shift.mean(dim=0).expand(points.shape[0])
+        else:
+            focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
+            if focal.ndim == 0:
+                focal = focal[None].expand(points.shape[0])
+            _, shift = recover_focal_shift(points, mask_binary, focal=focal)
+        fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
+        fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
+        intrinsics = utils3d.torch.intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
+        depth = points[..., 2] + shift[..., None, None]
+
+        # If projection constraint is forced, recompute the point map using the actual depth map
+        if force_projection:
+            points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
+        else:
+            points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
+
+        # Apply mask if needed
+        if apply_mask:
+            points = torch.where(mask_binary[..., None], points, torch.inf)
+            depth = torch.where(mask_binary, depth, torch.inf)
+
+        return_dict = {
+            'points': points,
+            'intrinsics': intrinsics,
+            'depth': depth,
+            'mask': mask_binary,
+            'mask_prob': torch.sigmoid(mask)
+        }
+
+        return return_dict
 
     @torch.inference_mode()
     def infer(
@@ -702,68 +711,44 @@ class MoGeModel(nn.Module):
             min_tokens, max_tokens = self.num_tokens_range
             num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
         
-        outputs = []
         with torch.autocast(device_type=image.device.type, dtype=torch.float16, enabled=use_fp16):
-            if omit_batch_dim:
-                output = self.forward(image, num_tokens, 1)
-                outputs.append(output)
-            else:
-                memory_banks = []
-                for i in tqdm(range(num_frames), desc="Processing video frames"):
-                    output, current_features = self.forward_video(image[i][None, ...], num_tokens, memory_banks)
-                    memory_banks.append(current_features)
-                    outputs.append(output)
+            output = self.forward(image, num_tokens)
 
-        point_list, intrinsics_list, depth_list, mask_binary_list, mask_list = [], [], [], [], []
-        for output in outputs:
-            points, mask = output['points'], output['mask']
+        points, mask = output['points'], output['mask']
 
-            mask_binary = mask > self.mask_threshold
+        mask_binary = mask > self.mask_threshold
 
-            # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
-            if fov_x is None:
-                focal, shift = recover_focal_shift(points, mask_binary)
-            else:
-                focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
-                if focal.ndim == 0:
-                    focal = focal[None].expand(points.shape[0])
-                _, shift = recover_focal_shift(points, mask_binary, focal=focal)
-            fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
-            fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
-            intrinsics = utils3d.torch.intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
-            depth = points[..., 2] + shift[..., None, None]
+        # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
+        if fov_x is None:
+            focal, shift = recover_focal_shift(points, mask_binary)
+        else:
+            focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
+            if focal.ndim == 0:
+                focal = focal[None].expand(points.shape[0])
+            _, shift = recover_focal_shift(points, mask_binary, focal=focal)
+        fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
+        fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
+        intrinsics = utils3d.torch.intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
+        depth = points[..., 2] + shift[..., None, None]
 
-            fov_x = 2 * torch.rad2deg(torch.atan(aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / focal))
-            
-            # If projection constraint is forced, recompute the point map using the actual depth map
-            if force_projection:
-                points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
-            else:
-                points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
+        # If projection constraint is forced, recompute the point map using the actual depth map
+        if force_projection:
+            points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
+        else:
+            points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
 
-            # Apply mask if needed
-            if apply_mask:
-                points = torch.where(mask_binary[..., None], points, torch.inf)
-                depth = torch.where(mask_binary, depth, torch.inf)
+        # Apply mask if needed
+        if apply_mask:
+            points = torch.where(mask_binary[..., None], points, torch.inf)
+            depth = torch.where(mask_binary, depth, torch.inf)
 
-            if omit_batch_dim:
-                points = points.squeeze(0)
-                intrinsics = intrinsics.squeeze(0)
-                depth = depth.squeeze(0)
-                mask_binary = mask_binary.squeeze(0)
-                mask = mask.squeeze(0)
-            else:
-                point_list.append(points)
-                intrinsics_list.append(intrinsics)
-                depth_list.append(depth)
-                mask_binary_list.append(mask_binary)
-                mask_list.append(mask)
-        if not omit_batch_dim:
-            points = torch.cat(point_list, dim=0)
-            intrinsics = torch.cat(intrinsics_list, dim=0)
-            depth = torch.cat(depth_list, dim=0)
-            mask_binary = torch.cat(mask_binary_list, dim=0)
-            mask = torch.cat(mask_list, dim=0)
+        if omit_batch_dim:
+            points = points.squeeze(0)
+            intrinsics = intrinsics.squeeze(0)
+            depth = depth.squeeze(0)
+            mask_binary = mask_binary.squeeze(0)
+            mask = mask.squeeze(0)
+
         return_dict = {
             'points': points,
             'intrinsics': intrinsics,

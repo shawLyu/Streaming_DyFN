@@ -89,9 +89,8 @@ def main(
     with torch.no_grad():
         # Use sliding window of size 3 with stride 1
         image_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).to(device)
-        output = model.infer(image_tensor, fov_x=fov_x_, 
-                                resolution_level=resolution_level, num_tokens=num_tokens, 
-                                use_fp16=use_fp16)
+        output = model.infer_video(image_tensor, fov_x=fov_x_, resolution_level=resolution_level, 
+                                   num_tokens=num_tokens, use_fp16=use_fp16)
 
         points = output['points'].cpu().numpy()
         depth = output['depth'].cpu().numpy()
