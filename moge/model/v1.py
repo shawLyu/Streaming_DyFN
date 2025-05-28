@@ -213,7 +213,7 @@ class TemporalHead(nn.Module):
 
             for h in range(t + 1):
                 feat = hidden_states[:, h, ...] # (B, D, H, W)
-                if (t - h) <= 2:
+                if (t - h) <= 4:
                     comp = feat
                 else:
                     comp = feat.mean(dim=(-2, -1)).reshape(B, D, 1, 1)

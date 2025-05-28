@@ -69,11 +69,11 @@ def affine_invariant_global_loss(
     weight = weight.clamp_max(10.0 * weighted_mean(weight, mask, dim=(-2, -1), keepdim=True))   # In case your data contains extremely small depth values
     loss = _smooth((pred_points - gt_points).abs() * weight[..., None], beta=beta).mean(dim=(-3, -2, -1))
     if pred_points.dim() == 4:
-        pred_points_inter_err = pred_points[1:, ...] * weight[1:, ..., None] - pred_points[:-1, ...] * weight[:-1, ..., None]
-        gt_points_inter_err = gt_points[1:, ...] * weight[1:, ..., None] - gt_points[:-1, ...] * weight[:-1, ..., None]
+        # pred_points_inter_err = pred_points[1:, ...] * weight[1:, ..., None] - pred_points[:-1, ...] * weight[:-1, ..., None]
+        # gt_points_inter_err = gt_points[1:, ...] * weight[1:, ..., None] - gt_points[:-1, ...] * weight[:-1, ..., None]
         loss = loss.mean(dim=0)
-        inter_err = (pred_points_inter_err - gt_points_inter_err).abs().mean(dim=(-4, -3, -2, -1))
-        loss = loss + inter_err
+        # inter_err = (pred_points_inter_err - gt_points_inter_err).abs().mean(dim=(-4, -3, -2, -1))
+        # loss = loss + inter_err
     if sparsity_aware:
         # Reweighting improves performance on sparse depth data. NOTE: this is not used in MoGe-1.
         sparsity = mask.float().mean(dim=(-2, -1)) / lr_mask.float().mean(dim=(-2, -1))
