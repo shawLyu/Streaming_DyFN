@@ -50,4 +50,4 @@ accelerate launch \
         --enable_mixed_precision True \
         --num_iterations 400000 \
         --save_every 1000 \
-        --log_every 100
+        --log_every 1000

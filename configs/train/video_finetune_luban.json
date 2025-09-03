@@ -105,8 +105,8 @@
         "type": "AdamW",
         "params": [
             {"params": {"include": ["*temporal_attention.*"], "lr": 1e-4}},
-            {"params": {"include": ["*"], "exclude": ["*temporal_attention.*", "*backbone.*"]}, "lr": 1e-6},
-            {"params": {"include": ["*backbone.*"]}, "lr": 5e-7}
+            {"params": {"include": ["*"], "exclude": ["*temporal_attention.*", "*backbone.*"]}, "lr": 1e-4},
+            {"params": {"include": ["*backbone.*"]}, "lr": 1e-5}
         ]
     },
     "lr_scheduler": {
@@ -114,7 +114,7 @@
         "params": {
             "schedulers": [
                 {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "max(0.0, min(1.0, (epoch - 1000) / 1000))", "max(0.0, min(1.0, (epoch - 1000) / 1000))"]}},
-                {"type": "StepLR", "params": {"step_size": 5000, "gamma": 0.5}}
+                {"type": "StepLR", "params": {"step_size": 10000, "gamma": 0.5}}
             ],
             "milestones": [1000]
         }

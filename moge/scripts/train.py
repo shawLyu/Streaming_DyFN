@@ -304,19 +304,17 @@ def main(
 
                     # Compute loss (per instance)
                     loss_list, weight_list = [], []
+                    gt_metric_scale = None
                     for i in range(current_batch_size):
-                        gt_metric_scale = None
                         loss_dict, weight_dict, misc_dict = {}, {}, {}
                         misc_dict['monitoring'] = monitoring(pred_points[i])
                         for k, v in config['loss'][label_type[i]].items():
                             weight_dict[k] = v['weight']
                             if v['function'] == 'affine_invariant_global_loss':
-                                loss_dict[k], misc_dict[k], gt_metric_scale = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'])
-                                if (i + 1) % sequence_length == 0:
-                                    loss_dict['video_' + k], misc_dict['video_' + k], _ = affine_invariant_global_loss(pred_points[i-sequence_length+1:i+1], 
-                                                                                                             gt_points[i-sequence_length+1:i+1], 
-                                                                                                             gt_mask[i-sequence_length+1:i+1], 
-                                                                                                             **v['params'])
+                                # loss_dict[k], misc_dict[k], gt_metric_scale = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'])
+                                if i % sequence_length == 0:
+                                    loss_dict['video_' + k], misc_dict['video_' + k], gt_metric_scale = affine_invariant_global_loss(pred_points[i:i+sequence_length], 
+                                                                                                             gt_points[i:i+sequence_length], gt_mask[i:i+sequence_length], **v['params'])
                                     weight_dict['video_' + k] = v['weight']
                             elif v['function'] == 'affine_invariant_local_loss':
                                 loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])

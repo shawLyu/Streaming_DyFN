@@ -230,10 +230,10 @@ class TemporalHead(nn.Module):
                 context_tokens = torch.cat(all_tokens[:-1], dim=1)         # (B, total, D)
                 rope_context = torch.cat(rope_tokens[:-1], dim=1)  # (B, total, D)
 
-                quary_tokens = all_tokens[-1]
-                rope_quary = rope_tokens[-1]
+                query_tokens = all_tokens[-1]
+                rope_query = rope_tokens[-1]
 
-                x = self.temporal_attention(quary_tokens, context=context_tokens, rope_q=rope_quary, rope_k=rope_context)
+                x = self.temporal_attention(query_tokens, context=context_tokens, rope_q=rope_query, rope_k=rope_context)
                 updated_x.append(x.reshape(B, patch_h, patch_w, D).permute(0, 3, 1, 2))
 
         return torch.cat(updated_x, dim=0)
@@ -301,11 +301,12 @@ class Head(nn.Module):
             proj(feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous())
                 for proj, (feat, clstoken) in zip(self.projects, hidden_states)
         ], dim=1).sum(dim=1)
+        feature_before_temporal_attention = x.clone()
 
         # update memory feature
         if len(memory_banks) > 0:
-            quary_feature = x
-            _, D, patch_h, patch_w = quary_feature.shape
+            query_feature = x
+            _, D, patch_h, patch_w = query_feature.shape
             # Update the memory banks
             for i , memory_cache in enumerate(memory_banks):
                 time_gap = len(memory_banks) - i
@@ -313,7 +314,7 @@ class Head(nn.Module):
                 if time_gap == 3:
                     memory_cache = memory_cache.mean(dim=(-2, -1)).reshape(1, D, 1, 1)
 
-            quary_rope = self.temporal_attention.rope(0).unsqueeze(0).expand(1, patch_h * patch_w, -1)
+            query_rope = self.temporal_attention.rope(0).unsqueeze(0).expand(1, patch_h * patch_w, -1)
 
             context_tokens = []
             context_rope = []
@@ -325,14 +326,15 @@ class Head(nn.Module):
             context_tokens = torch.cat(context_tokens, dim=1)
             context_rope = torch.cat(context_rope, dim=1)
 
-            quary_feature = quary_feature.reshape(quary_feature.shape[0], D, -1).permute(0, 2, 1)
-            x = self.temporal_attention.temporal_attention(quary_feature, context=context_tokens, rope_q=quary_rope, rope_k=context_rope)
+            query_feature = query_feature.reshape(query_feature.shape[0], D, -1).permute(0, 2, 1)
+            x = self.temporal_attention.temporal_attention(query_feature, context=context_tokens, rope_q=query_rope, rope_k=context_rope)
             x = x.reshape(x.shape[0], patch_h, patch_w, D).permute(0, 3, 1, 2)
-            memory_banks.append(quary_feature.permute(0, 2, 1).reshape(-1, D, patch_h, patch_w))
+            memory_banks.append(query_feature.permute(0, 2, 1).reshape(-1, D, patch_h, patch_w))
             # memory_banks.append(x)
         else:
             memory_banks.append(x)
 
+        feature_after_temporal_attention = x.clone()
         # Upsample stage
         # (patch_h, patch_w) -> (patch_h * 2, patch_w * 2) -> (patch_h * 4, patch_w * 4) -> (patch_h * 8, patch_w * 8)
         for i, block in enumerate(self.upsample_blocks):
@@ -354,7 +356,7 @@ class Head(nn.Module):
         else:
             output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
         
-        return output
+        return output, feature_after_temporal_attention, feature_before_temporal_attention
             
     def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, memory_banks: List[torch.Tensor] = None):
         img_h, img_w = image.shape[-2:]
@@ -602,11 +604,13 @@ class MoGeModel(nn.Module):
         memory_banks = []
         points_list = []
         masks_list = []
+        feature_after_temporal_attention_list = []
+        feature_before_temporal_attention_list = []
         # Get intermediate layers from the backbone
         for i in tqdm(range(image_14.shape[0]), desc="Processing frames"):
             features = self.backbone.get_intermediate_layers(image_14[i][None, ...], self.intermediate_layers, return_class_token=True)
 
-            output = self.head.forward_with_memory(features, image, memory_banks)
+            output, feature_after_temporal_attention, feature_before_temporal_attention = self.head.forward_with_memory(features, image, memory_banks)
             points, mask = output
         
             # Make sure fp32 precision for output
@@ -620,6 +624,8 @@ class MoGeModel(nn.Module):
                 points = self._remap_points(points)     # slightly improves the performance in case of very large output values
                 points_list.append(points)
                 masks_list.append(mask)
+                feature_after_temporal_attention_list.append(feature_after_temporal_attention)
+                feature_before_temporal_attention_list.append(feature_before_temporal_attention)
         
         points = torch.concat(points_list, dim=0)
         mask = torch.concat(masks_list, dim=0)
@@ -657,7 +663,9 @@ class MoGeModel(nn.Module):
             'intrinsics': intrinsics,
             'depth': depth,
             'mask': mask_binary,
-            'mask_prob': torch.sigmoid(mask)
+            'mask_prob': torch.sigmoid(mask),
+            'feature_after_temporal_attention': feature_after_temporal_attention_list,
+            'feature_before_temporal_attention': feature_before_temporal_attention_list,
         }
 
         return return_dict
