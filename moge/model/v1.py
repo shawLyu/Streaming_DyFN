@@ -19,6 +19,8 @@ import utils3d
 from huggingface_hub import hf_hub_download
 # from timm.models.layers import trunc_normal_
 
+from .layers.block import Block
+from .layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift, gaussian_blur_2d
 from .utils import wrap_dinov2_attention_with_sdpa, wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
 from ..utils.tools import timeit
@@ -184,6 +186,38 @@ class RotaryPositionalEmbedding(nn.Module):
         pooled = rope_emb.unfold(0, factor, factor).mean(dim=-1)
         return pooled  # (seq_len // factor, dim)
 
+
+class BidirectionalHead(nn.Module):
+    def __init__(self, hidden_dim, num_heads=8, expansion=4, init_values=1e-2, qk_norm=False):
+        super().__init__()
+        self.rope = RotaryPositionEmbedding2D(frequency=100.0)
+        self.position_getter = PositionGetter() if self.rope is not None else None
+
+        self.block = Block(
+                        dim=hidden_dim,
+                        num_heads=num_heads,
+                        mlp_ratio=expansion,
+                        qkv_bias=True,
+                        proj_bias=True,
+                        ffn_bias=True,
+                        init_values=init_values,
+                        qk_norm=qk_norm,
+                        rope=self.rope,
+                        attn_type="global",
+                        )
+
+    def forward(self, hidden_states: torch.Tensor):
+        S, D, H, W = hidden_states.shape
+        hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(1, S * H * W, D)
+
+        pos = None
+        pos = self.position_getter(S, H, W, device=hidden_states.device)
+        pos = pos.view(1, S, H*W, 2).view(1, S * H * W, 2)
+
+        hidden_states = self.block(hidden_states, pos=pos)
+        hidden_states = hidden_states.reshape(S, H, W, D).permute(0, 3, 1, 2)
+        return hidden_states
+
 class TemporalHead(nn.Module):
     def __init__(self, hidden_dim, num_heads=8, expansion=4, dropout=0.0, layer_scale=1.0, max_len=1024):
         super().__init__()
@@ -259,9 +293,9 @@ class Head(nn.Module):
             nn.Conv2d(in_channels=dim_in, out_channels=dim_proj, kernel_size=1, stride=1, padding=0,) for _ in range(num_features)
         ])
 
-        self.temporal_attention = TemporalHead(
-            hidden_dim=dim_proj, num_heads=1, expansion=4, dropout=0.0, layer_scale=1.0,
-        )
+
+        self.bidirectional_head = nn.ModuleList([BidirectionalHead(
+            hidden_dim=dim_proj, num_heads=4, expansion=4, init_values=1e-2, qk_norm=True) for _ in range(4)])
 
         self.upsample_blocks = nn.ModuleList([
             nn.Sequential(
@@ -368,8 +402,10 @@ class Head(nn.Module):
                 for proj, (feat, clstoken) in zip(self.projects, hidden_states)
         ], dim=1).sum(dim=1)
 
-        if self.training:
-            x = self.temporal_attention(x, image)
+        # if self.training:
+        # import ipdb;ipdb.set_trace()
+        for i, bidirectional_head in enumerate(self.bidirectional_head):
+            x = bidirectional_head(x)
         # Upsample stage
         # (patch_h, patch_w) -> (patch_h * 2, patch_w * 2) -> (patch_h * 4, patch_w * 4) -> (patch_h * 8, patch_w * 8)
         for i, block in enumerate(self.upsample_blocks):
@@ -434,6 +470,8 @@ class MoGeModel(nn.Module):
         hub_loader = getattr(importlib.import_module(".dinov2.hub.backbones", __package__), encoder)
         self.backbone = hub_loader(pretrained=False)
         dim_feature = self.backbone.blocks[0].attn.qkv.in_features
+        for param in self.backbone.parameters():
+            param.requires_grad = False
 
         self.head = Head(
             num_features=intermediate_layers if isinstance(intermediate_layers, int) else len(intermediate_layers), 
@@ -567,7 +605,7 @@ class MoGeModel(nn.Module):
             points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
             points = self._remap_points(points)     # slightly improves the performance in case of very large output values
         
-        return_dict = {'points': points, 'mask': mask}
+        return_dict = {'points': points, 'mask': mask, "features": features}
         return return_dict
 
 
@@ -610,7 +648,8 @@ class MoGeModel(nn.Module):
         for i in tqdm(range(image_14.shape[0]), desc="Processing frames"):
             features = self.backbone.get_intermediate_layers(image_14[i][None, ...], self.intermediate_layers, return_class_token=True)
 
-            output, feature_after_temporal_attention, feature_before_temporal_attention = self.head.forward_with_memory(features, image, memory_banks)
+            # output, feature_after_temporal_attention, feature_before_temporal_attention = self.head.forward_with_memory(features, image, memory_banks)
+            output = self.head(features, image)
             points, mask = output
         
             # Make sure fp32 precision for output
@@ -762,7 +801,8 @@ class MoGeModel(nn.Module):
             'intrinsics': intrinsics,
             'depth': depth,
             'mask': mask_binary,
-            'mask_prob': torch.sigmoid(mask)
+            'mask_prob': torch.sigmoid(mask),
+            "features": output["features"]
         }
 
         return return_dict

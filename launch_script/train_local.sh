@@ -3,14 +3,14 @@ conda activate video_depth
 
 CFG=${1:-"configs/train/video_finetune_local.json"}
 
-WORKSPACE=${2:-"workspace/test_debug_local_test_nan"}
+WORKSPACE=${2:-"workspace/video_finetune_local"}
 
 accelerate launch \
-    --num_processes 1 \
+    --num_processes 2 \
     moge/scripts/train.py \
     --config $CFG \
     --workspace $WORKSPACE \
-    --checkpoint latest\
+    --checkpoint pretrained_moge/image_pretrained_moge.pt \
     --gradient_accumulation_steps 1 \
     --batch_size_forward 1 \
     --enable_gradient_checkpointing False \

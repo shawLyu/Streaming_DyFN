@@ -66,26 +66,6 @@
                 "weight": 2.7,
                 "fov_range_absolute": [60, 120],
                 "image_augmentation": ["jittering", "jpeg_loss", "blurring", "shot_noise"]
-            },
-            {
-                "name": "mvs_synth",
-                "path": "data/moge_process_dataset/mvs_synth",
-                "label_type": "synthetic",
-                "index": "index.txt",
-                "depth": "depth.png",
-                "weight": 1.2,
-                "center_augmentation": 0.5,
-                "fov_range_absolute": [60, 120],
-                "image_augmentation": ["jittering", "jpeg_loss", "blurring", "shot_noise"]
-            },
-            {
-                "name": "waymo",
-                "path": "data/moge_process_dataset/waymo",
-                "label_type": "lidar",
-                "index": "index.txt",
-                "depth": "depth.png",
-                "weight": 5.0,
-                "fov_range_absolute": [60, 120]
             }
         ]
     },
@@ -104,16 +84,15 @@
     "optimizer": {
         "type": "AdamW",
         "params": [
-            {"params": {"include": ["*temporal_attention.*"], "lr": 1e-4}},
-            {"params": {"include": ["*"], "exclude": ["*temporal_attention.*", "*backbone.*"]}, "lr": 1e-6},
-            {"params": {"include": ["*backbone.*"]}, "lr": 5e-7}
+            {"params": {"include": ["*bidirectional_head.*"], "lr": 1e-4}},
+            {"params": {"include": ["*"], "exclude": ["*backbone.*", "*bidirectional_head.*"]}, "lr": 1e-6}
         ]
     },
     "lr_scheduler": {
         "type": "SequentialLR",
         "params": {
             "schedulers": [
-                {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "max(0.0, min(1.0, (epoch - 1000) / 1000))", "max(0.0, min(1.0, (epoch - 1000) / 1000))"]}},
+                {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "max(0.0, min(1.0, (epoch - 1000) / 1000))"]}},
                 {"type": "StepLR", "params": {"step_size": 5000, "gamma": 0.5}}
             ],
             "milestones": [1000]
