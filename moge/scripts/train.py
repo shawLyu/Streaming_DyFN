@@ -15,6 +15,7 @@ import io
 import numpy as np
 import cv2
 from PIL import Image
+import mediapy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,9 +42,10 @@ from moge.train.losses import (
 )
 from moge.train.utils import build_optimizer, build_lr_scheduler
 from moge.utils.geometry_torch import intrinsics_to_fov
-from moge.utils.vis import colorize_depth, colorize_normal
+from moge.utils.vis import colorize_depth, colorize_normal, colorize_depth_video
 from moge.utils.tools import key_average, recursive_replace, CallbackOnException, flatten_nested_dict
 from moge.test.metrics import compute_metrics
+from moge.utils.alignment import align_affine_lstsq
 
 
 @click.command()
@@ -59,7 +61,7 @@ from moge.test.metrics import compute_metrics
 @click.option('--save_every', type=int, default=10000, help='Save checkpoint every n iterations')
 @click.option('--log_every', type=int, default=1000, help='Log metrics every n iterations')
 @click.option('--vis_every', type=int, default=0, help='Visualize every n iterations')
-@click.option('--num_vis_images', type=int, default=24, help='Number of images to visualize, must be a multiple of divided batch size')
+@click.option('--num_vis_images_batch', type=int, default=2, help='Number of images to visualize, must be a multiple of divided batch size')
 @click.option('--enable_mlflow', type=bool, default=True, help='Log metrics to MLFlow')
 @click.option('--seed', type=int, default=0, help='Random seed')
 def main(
@@ -75,7 +77,7 @@ def main(
     save_every: int,
     log_every: int,
     vis_every: int,
-    num_vis_images: int,
+    num_vis_images_batch: int,
     enable_mlflow: bool,
     seed: Optional[int],
 ):
@@ -241,9 +243,7 @@ def main(
         # Get some batches for visualization
         if accelerator.is_main_process:
             batches_for_vis: List[Dict[str, torch.Tensor]] = []
-            # TODO: We give the fixed number of sequences length here. We need to fix it later.
-            num_vis_images = num_vis_images // batch_size_forward // sequence_length * batch_size_forward * sequence_length
-            for _ in range(num_vis_images // batch_size_forward // sequence_length):
+            for _ in range(num_vis_images_batch):
                 batch = train_data_pipe.get()
                 batches_for_vis.append(batch)
 
@@ -254,6 +254,7 @@ def main(
                 image, gt_depth, gt_mask, gt_mask_inf, gt_intrinsics, info = batch['image'], batch['depth'], batch['depth_mask'], batch['depth_mask_inf'], batch['intrinsics'], batch['info']
                 gt_points = utils3d.torch.depth_to_points(gt_depth, intrinsics=gt_intrinsics)
                 gt_normal, gt_normal_mask = utils3d.torch.points_to_normals(gt_points, gt_mask)
+                colored_depth_numpy, image_numpy = [], []
                 for i_instance in range(batch['image'].shape[0]):
                     idx = i_batch * batch_size_forward * sequence_length + i_instance
                     image_i = (image[i_instance].numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
@@ -271,6 +272,14 @@ def main(
                     cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/mask_inf.png')), gt_mask_inf_i * 255)
                     with save_dir.joinpath(f'{idx:04d}/info.json').open('w') as f:
                         json.dump(info[i_instance], f)
+
+                    colored_depth_numpy.append(colorize_depth_video(1 / gt_depth_i, gt_mask_i, min_disp=1 / gt_depth[gt_mask].max().item(), 
+                                                max_disp=1 / gt_depth[gt_mask].min().item()))
+                    image_numpy.append(image_i)
+                colored_depth_numpy = np.stack(colored_depth_numpy, axis=0)
+                image_numpy = np.stack(image_numpy, axis=0)
+                combined_video = np.concatenate([image_numpy, colored_depth_numpy], axis=2)
+                mediapy.write_video(save_dir.joinpath(f'image_depth_vis_batch_{i_batch}.mp4'), combined_video, fps=10, crf=18)
 
         # Reset seed to avoid training on the same data when resuming training
         if seed is not None:
@@ -311,11 +320,11 @@ def main(
                         for k, v in config['loss'][label_type[i]].items():
                             weight_dict[k] = v['weight']
                             if v['function'] == 'affine_invariant_global_loss':
-                                # loss_dict[k], misc_dict[k], gt_metric_scale = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'])
-                                if i % sequence_length == 0:
-                                    loss_dict['video_' + k], misc_dict['video_' + k], gt_metric_scale = affine_invariant_global_loss(pred_points[i:i+sequence_length], 
-                                                                                                             gt_points[i:i+sequence_length], gt_mask[i:i+sequence_length], **v['params'])
-                                    weight_dict['video_' + k] = v['weight']
+                                loss_dict[k], misc_dict[k], gt_metric_scale = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'])
+                                # if i % sequence_length == 0:
+                                #     loss_dict['video_' + k], misc_dict['video_' + k], gt_metric_scale = affine_invariant_global_loss(pred_points[i:i+sequence_length], 
+                                #                                                                              gt_points[i:i+sequence_length], gt_mask[i:i+sequence_length], **v['params'])
+                                #     weight_dict['video_' + k] = v['weight']
                             elif v['function'] == 'affine_invariant_local_loss':
                                 loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
                             elif v['function'] == 'normal_loss':
@@ -450,17 +459,34 @@ def main(
                         pred_points, pred_depth, pred_mask = output['points'].cpu().numpy(), output['depth'].cpu().numpy(), output['mask'].cpu().numpy()
                         image = image.cpu().numpy()
 
+                        colored_depth_numpy, aligned_depth_numpy, image_numpy = [], [], []
                         for i_instance in range(image.shape[0]):
                             idx = i_batch * batch_size_forward * sequence_length + i_instance
                             image_i = (image[i_instance].transpose(1, 2, 0) * 255).astype(np.uint8)
                             pred_points_i = pred_points[i_instance]
                             pred_mask_i = pred_mask[i_instance]
                             pred_depth_i = pred_depth[i_instance]
+                            pred_depth_i_valid = pred_depth_i[pred_mask_i & np.isfinite(pred_depth_i)].reshape(1, -1)
+                            gt_depth_i_valid = gt_depth[i_instance][pred_mask_i & np.isfinite(pred_depth_i)].reshape(1, -1)
+                            # Using lstsq to align the predicted depth with the ground truth depth
+                            scale, shift = align_affine_lstsq(torch.from_numpy(pred_depth_i_valid).to(device), gt_depth_i_valid)
                             save_dir.joinpath(f'{idx:04d}').mkdir(parents=True, exist_ok=True)
                             cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/image.jpg')), cv2.cvtColor(image_i, cv2.COLOR_RGB2BGR))
                             cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/points.exr')), cv2.cvtColor(pred_points_i, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
                             cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/mask.png')), pred_mask_i * 255)
                             cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/depth_vis.png')), cv2.cvtColor(colorize_depth(pred_depth_i, pred_mask_i), cv2.COLOR_RGB2BGR))
+                            colored_depth_numpy.append(colorize_depth_video(1 / pred_depth_i, pred_mask_i, 
+                                                    min_disp=1/pred_depth[pred_mask].max().item(), max_disp=1 / pred_depth[pred_mask].min().item()))
+                            pred_depth_i = scale.item() * pred_depth_i + shift.item()
+                            aligned_depth_numpy.append(colorize_depth_video(1 / pred_depth_i, pred_mask_i, 
+                                                    min_disp=1 / gt_depth[gt_mask].max().item(), 
+                                                    max_disp=1 / gt_depth[gt_mask].min().item()))
+                            image_numpy.append(image_i)
+                        colored_depth_numpy = np.stack(colored_depth_numpy, axis=0)
+                        aligned_depth_numpy = np.stack(aligned_depth_numpy, axis=0)
+                        image_numpy = np.stack(image_numpy, axis=0)
+                        combined_video = np.concatenate([image_numpy, colored_depth_numpy, aligned_depth_numpy], axis=2)
+                        mediapy.write_video(save_dir.joinpath(f'image_depth_vis_batch_{i_batch}.mp4'), combined_video, fps=10, crf=18)
 
             pbar.set_postfix({'loss': loss.item()}, refresh=False)
             pbar.update(1)

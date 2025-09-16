@@ -35,6 +35,7 @@ class TrainDataLoaderPipeline:
         self.image_augmentation = config.get('image_augmentation', [])
         self.depth_interpolation = config.get('depth_interpolation', 'bilinear')
         self.sampled_sequence_length = config.get('sampled_sequence_length', 3)
+        self.sampling_stride = config.get('sampling_stride', 3)
 
         if 'image_sizes' in config:
             self.image_size_strategy = 'fixed'
@@ -106,8 +107,10 @@ class TrainDataLoaderPipeline:
                     sampled_filenames = sequence_filenames + [sequence_filenames[-1]] * (self.sampled_sequence_length - len(sequence_filenames))
                 else:
                     # Randomly select a starting point that allows k continuous frames
-                    start_idx = random.randint(0, len(sequence_filenames) - self.sampled_sequence_length)
-                    sampled_filenames = sequence_filenames[start_idx:start_idx + self.sampled_sequence_length]
+                    # Sample k frames with stride n
+                    max_start = len(sequence_filenames) - (self.sampled_sequence_length - 1) * self.sampling_stride
+                    start_idx = random.randint(0, max_start - 1)
+                    sampled_filenames = [sequence_filenames[start_idx + i*self.sampling_stride] for i in range(self.sampled_sequence_length)]
 
                 seed = random.randint(0, 2 ** 32 - 1)
                 for filename in sampled_filenames:
