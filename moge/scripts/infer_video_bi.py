@@ -124,7 +124,6 @@ def main(
         depth_preds_color = colorize_depth_video(aligned_disp, min_disp=min_disp, max_disp=max_disp)
         output_path = os.path.join(output_dir, f'{video_name}_aligned_depth.mp4')
         mediapy.write_video(output_path, depth_preds_color, fps=10, crf=18)
-        import ipdb; ipdb.set_trace()
 
         points = output['points'].cpu().numpy()
         depth = output['depth'].cpu().numpy()

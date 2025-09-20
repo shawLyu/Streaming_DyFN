@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.version
-from torch.amp import GradScaler
 import accelerate
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
@@ -39,6 +38,7 @@ from moge.train.losses import (
     mask_l2_loss, 
     mask_bce_loss,
     monitoring, 
+    scale_shift_loss,
 )
 from moge.train.utils import build_optimizer, build_lr_scheduler
 from moge.utils.geometry_torch import intrinsics_to_fov
@@ -61,7 +61,7 @@ from moge.utils.alignment import align_affine_lstsq
 @click.option('--save_every', type=int, default=10000, help='Save checkpoint every n iterations')
 @click.option('--log_every', type=int, default=1000, help='Log metrics every n iterations')
 @click.option('--vis_every', type=int, default=0, help='Visualize every n iterations')
-@click.option('--num_vis_images_batch', type=int, default=2, help='Number of images to visualize, must be a multiple of divided batch size')
+@click.option('--num_vis_images_batch', type=int, default=1, help='Number of images to visualize, must be a multiple of divided batch size')
 @click.option('--enable_mlflow', type=bool, default=True, help='Log metrics to MLFlow')
 @click.option('--seed', type=int, default=0, help='Random seed')
 def main(
@@ -89,7 +89,7 @@ def main(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision='fp16' if enable_mixed_precision else None,
         kwargs_handlers=[
-            DistributedDataParallelKwargs(find_unused_parameters=True)
+            DistributedDataParallelKwargs(find_unused_parameters=False)
         ]
     )
     device = accelerator.device
@@ -188,10 +188,6 @@ def main(
         else:
             checkpoint = None
 
-    if checkpoint is not None:
-        safe_scaler = GradScaler(init_scale=2**4, growth_interval=100, growth_factor=2.0, backoff_factor=0.5)
-        accelerator.scaler = safe_scaler
-
     if checkpoint is None:
         # Initialize model weights
         print('Initialize model weights')
@@ -238,7 +234,7 @@ def main(
     with (
         train_data_pipe,
         tqdm(initial=initial_step, total=num_iterations, desc='Training', disable=not accelerator.is_main_process) as pbar,
-        ThreadPoolExecutor(max_workers=1) as save_checkpoint_executor,
+        ThreadPoolExecutor(max_workers=4) as save_checkpoint_executor,
     ):  
         # Get some batches for visualization
         if accelerator.is_main_process:
@@ -276,10 +272,14 @@ def main(
                     colored_depth_numpy.append(colorize_depth_video(1 / gt_depth_i, gt_mask_i, min_disp=1 / gt_depth[gt_mask].max().item(), 
                                                 max_disp=1 / gt_depth[gt_mask].min().item()))
                     image_numpy.append(image_i)
-                colored_depth_numpy = np.stack(colored_depth_numpy, axis=0)
-                image_numpy = np.stack(image_numpy, axis=0)
-                combined_video = np.concatenate([image_numpy, colored_depth_numpy], axis=2)
-                mediapy.write_video(save_dir.joinpath(f'image_depth_vis_batch_{i_batch}.mp4'), combined_video, fps=10, crf=18)
+                    if len(colored_depth_numpy) == sequence_length:
+                        colored_depth_numpy = np.stack(colored_depth_numpy, axis=0)
+                        image_numpy = np.stack(image_numpy, axis=0)
+                        combined_video = np.concatenate([image_numpy, colored_depth_numpy], axis=2)
+                        mediapy.write_video(save_dir.joinpath(f'image_depth_vis_batch_{i_batch}_seg_{i_instance // sequence_length}.mp4'), combined_video, fps=10)
+
+                        colored_depth_numpy = []
+                        image_numpy = []
 
         # Reset seed to avoid training on the same data when resuming training
         if seed is not None:
@@ -294,6 +294,7 @@ def main(
                 batch = train_data_pipe.get()
                 image, gt_depth, gt_mask, gt_mask_fin, gt_mask_inf, gt_intrinsics, label_type, is_metric = batch['image'], batch['depth'], batch['depth_mask'], batch['depth_mask_fin'], batch['depth_mask_inf'], batch['intrinsics'], batch['label_type'], batch['is_metric']
                 image, gt_depth, gt_mask, gt_mask_fin, gt_mask_inf, gt_intrinsics = image.to(device), gt_depth.to(device), gt_mask.to(device), gt_mask_fin.to(device), gt_mask_inf.to(device), gt_intrinsics.to(device)
+                image = image.reshape(batch_size_forward, sequence_length, *image.shape[1:]) # (B, S, 3, H, W)
                 current_batch_size = image.shape[0]
                 if all(label == 'invalid' for label in label_type):
                     continue            # NOTE: Skip all-invalid batches to avoid messing up the optimizer.
@@ -309,22 +310,20 @@ def main(
                         num_tokens = accelerate.utils.broadcast_object_list([random.randint(*config['model']['num_tokens_range'])])[0]
                     with torch.autocast(device_type=accelerator.device.type, dtype=torch.float16, enabled=enable_mixed_precision):
                         output = model(image, num_tokens=num_tokens)
-                    pred_points, pred_mask, pred_metric_scale = output['points'], output['mask'], output.get('metric_scale', None)
+                    pred_points, pred_mask, pred_metric_scale, pred_shift = output['points'], output['mask'], output.get('metric_scale', None), output.get('shift', None)
 
                     # Compute loss (per instance)
                     loss_list, weight_list = [], []
                     gt_metric_scale = None
+                    gt_shift = None
                     for i in range(current_batch_size):
                         loss_dict, weight_dict, misc_dict = {}, {}, {}
                         misc_dict['monitoring'] = monitoring(pred_points[i])
                         for k, v in config['loss'][label_type[i]].items():
                             weight_dict[k] = v['weight']
                             if v['function'] == 'affine_invariant_global_loss':
-                                loss_dict[k], misc_dict[k], gt_metric_scale = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'])
-                                # if i % sequence_length == 0:
-                                #     loss_dict['video_' + k], misc_dict['video_' + k], gt_metric_scale = affine_invariant_global_loss(pred_points[i:i+sequence_length], 
-                                #                                                                              gt_points[i:i+sequence_length], gt_mask[i:i+sequence_length], **v['params'])
-                                #     weight_dict['video_' + k] = v['weight']
+                                loss_dict[k], misc_dict[k], gt_metric_scale, gt_shift = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'])
+                                # loss_dict[k], misc_dict[k], _, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=None, gt_shift=None)
                             elif v['function'] == 'affine_invariant_local_loss':
                                 loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
                             elif v['function'] == 'normal_loss':
@@ -340,9 +339,9 @@ def main(
                         weight_dict = {'.'.join(k): v for k, v in flatten_nested_dict(weight_dict).items()}
                         loss_dict = {'.'.join(k): v for k, v in flatten_nested_dict(loss_dict).items()}
                         loss_ = sum([weight_dict[k] * loss_dict[k] for k in loss_dict], start=torch.tensor(0.0, device=device))
-                        if loss_ > 1.0 and accelerator.is_main_process and i_step > 100:
-                            pbar.write(str(loss_dict))
-                            pbar.write(str(batch['info'][i]))
+                        # if loss_ > 1.0 and accelerator.is_main_process and i_step > 100:
+                            # pbar.write(str(loss_dict))
+                            # pbar.write(str(batch['info'][i]))
                         loss_list.append(loss_)
                         
                         if torch.isnan(loss_).item():
@@ -455,12 +454,34 @@ def main(
                         image, gt_depth, gt_mask, gt_intrinsics = batch['image'], batch['depth'], batch['depth_mask'], batch['intrinsics']
                         image, gt_depth, gt_mask, gt_intrinsics = image.to(device), gt_depth.to(device), gt_mask.to(device), gt_intrinsics.to(device)
                         
+                        image = image.reshape(batch_size_forward, sequence_length, *image.shape[1:]) # (B, S, 3, H, W)
                         output = unwrapped_model.infer(image)
+                        image = image.reshape(-1, *image.shape[2:])
                         pred_points, pred_depth, pred_mask = output['points'].cpu().numpy(), output['depth'].cpu().numpy(), output['mask'].cpu().numpy()
                         image = image.cpu().numpy()
 
+                        pred_depth_reshape = pred_depth.reshape(batch_size_forward, sequence_length, *pred_depth.shape[1:])
+                        mask_reshape = gt_mask.reshape(batch_size_forward, sequence_length, *pred_mask.shape[1:]).cpu().numpy()
+                        gt_depth_reshape = gt_depth.reshape(batch_size_forward, sequence_length, *gt_depth.shape[1:]).cpu().numpy()
+
+                        # Compute min/max per batch (all images in the batch share the same min/max)
+                        min_pred_depth = np.full((batch_size_forward,), np.inf, dtype=pred_depth_reshape.dtype)
+                        max_pred_depth = np.full((batch_size_forward,), -np.inf, dtype=pred_depth_reshape.dtype)
+                        min_gt_depth = np.full((batch_size_forward,), np.inf, dtype=gt_depth_reshape.dtype)
+                        max_gt_depth = np.full((batch_size_forward,), -np.inf, dtype=gt_depth_reshape.dtype)
+                        for b in range(batch_size_forward):
+                            mask = mask_reshape[b]
+                            depth = pred_depth_reshape[b]
+                            depth_gt = gt_depth_reshape[b]
+                            if np.any(mask):
+                                min_pred_depth[b] = depth[mask].min()
+                                max_pred_depth[b] = depth[mask].max()
+                                min_gt_depth[b] = depth_gt[mask].min()
+                                max_gt_depth[b] = depth_gt[mask].max()
+
                         colored_depth_numpy, aligned_depth_numpy, image_numpy = [], [], []
                         for i_instance in range(image.shape[0]):
+                            seq = i_instance // sequence_length
                             idx = i_batch * batch_size_forward * sequence_length + i_instance
                             image_i = (image[i_instance].transpose(1, 2, 0) * 255).astype(np.uint8)
                             pred_points_i = pred_points[i_instance]
@@ -476,17 +497,22 @@ def main(
                             cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/mask.png')), pred_mask_i * 255)
                             cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/depth_vis.png')), cv2.cvtColor(colorize_depth(pred_depth_i, pred_mask_i), cv2.COLOR_RGB2BGR))
                             colored_depth_numpy.append(colorize_depth_video(1 / pred_depth_i, pred_mask_i, 
-                                                    min_disp=1/pred_depth[pred_mask].max().item(), max_disp=1 / pred_depth[pred_mask].min().item()))
+                                                    min_disp=1 / max_pred_depth[i_instance // sequence_length], max_disp=1 / min_pred_depth[i_instance // sequence_length]))
                             pred_depth_i = scale.item() * pred_depth_i + shift.item()
                             aligned_depth_numpy.append(colorize_depth_video(1 / pred_depth_i, pred_mask_i, 
-                                                    min_disp=1 / gt_depth[gt_mask].max().item(), 
-                                                    max_disp=1 / gt_depth[gt_mask].min().item()))
+                                                    min_disp=1 / max_gt_depth[i_instance // sequence_length], 
+                                                    max_disp=1 / min_gt_depth[i_instance // sequence_length]))
                             image_numpy.append(image_i)
-                        colored_depth_numpy = np.stack(colored_depth_numpy, axis=0)
-                        aligned_depth_numpy = np.stack(aligned_depth_numpy, axis=0)
-                        image_numpy = np.stack(image_numpy, axis=0)
-                        combined_video = np.concatenate([image_numpy, colored_depth_numpy, aligned_depth_numpy], axis=2)
-                        mediapy.write_video(save_dir.joinpath(f'image_depth_vis_batch_{i_batch}.mp4'), combined_video, fps=10, crf=18)
+
+                            if len(colored_depth_numpy) == sequence_length:
+                                colored_depth_numpy = np.stack(colored_depth_numpy, axis=0)
+                                aligned_depth_numpy = np.stack(aligned_depth_numpy, axis=0)
+                                image_numpy = np.stack(image_numpy, axis=0)
+                                combined_video = np.concatenate([image_numpy, colored_depth_numpy, aligned_depth_numpy], axis=2)
+                                mediapy.write_video(save_dir.joinpath(f'image_depth_vis_batch_{i_batch}_seg_{i_instance // sequence_length}.mp4'), combined_video, fps=10)
+                                colored_depth_numpy = []
+                                aligned_depth_numpy = []
+                                image_numpy = []
 
             pbar.set_postfix({'loss': loss.item()}, refresh=False)
             pbar.update(1)

@@ -101,10 +101,10 @@ class TrainDataLoaderPipeline:
                 sequence_name = random.choice(self.datasets[dataset_name]['sequences'])
                 sequence_filenames = self.datasets[dataset_name]['sequence_to_files'][sequence_name]
                 # Sample k continuous frames from the sequence
-                if len(sequence_filenames) < self.sampled_sequence_length:
+                if len(sequence_filenames) < self.sampled_sequence_length * self.sampling_stride:
                     # If sequence is too short, just repeat the last frame
-                    start_idx = 0
-                    sampled_filenames = sequence_filenames + [sequence_filenames[-1]] * (self.sampled_sequence_length - len(sequence_filenames))
+                    repeated_length = self.sampled_sequence_length - len(sequence_filenames[::self.sampling_stride])
+                    sampled_filenames = sequence_filenames[::self.sampling_stride] + [sequence_filenames[-1]] * repeated_length
                 else:
                     # Randomly select a starting point that allows k continuous frames
                     # Sample k frames with stride n

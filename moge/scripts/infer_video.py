@@ -92,7 +92,8 @@ def main(
 
     model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
 
-    frames = frames[:, 10:-10, 10:-10, :]
+    # frames = frames[:, 10:-10, 10:-10, :]
+    frames = frames[:60, :, :, :]
 
     height, width = frames.shape[1:3]
 
@@ -115,7 +116,7 @@ def main(
         save_path.mkdir(exist_ok=True, parents=True)
 
         normals_list = []
-        for i, frame in enumerate(frames):
+        for i, frame in tqdm(enumerate(frames), total=len(frames), desc="Processing frames"):
             normals, normals_mask = utils3d.numpy.points_to_normals(points[i], mask=mask[i])
             normals_list.append(colorize_normal(normals))
             if save_ply_:

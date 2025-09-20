@@ -35,32 +35,40 @@ def affine_invariant_global_loss(
     align_resolution: int = 64, 
     beta: float = 0.0, 
     trunc: float = 1.0, 
-    sparsity_aware: bool = False
+    sparsity_aware: bool = False,
+    gt_metric_scale: torch.Tensor = None,
+    gt_shift: torch.Tensor = None
 ):
     device = pred_points.device
 
-    if pred_points.dim() == 3:
-        # Align
-        (pred_points_lr, gt_points_lr), lr_mask = mask_aware_nearest_resize((pred_points, gt_points), mask=mask, size=(align_resolution, align_resolution))
-        scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
-        valid = scale > 0
-        scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
-    elif pred_points.dim() == 4:
-        pred_points_list, gt_points_list, mask_list = [], [], []
-        for pred_points_i, gt_points_i, mask_i in zip(pred_points, gt_points, mask):
-            # Align
-            (pred_points_lr, gt_points_lr), lr_mask = mask_aware_nearest_resize((pred_points_i, gt_points_i), mask=mask_i, size=(align_resolution, align_resolution))
-            pred_points_list.append(pred_points_lr)
-            gt_points_list.append(gt_points_lr)
-            mask_list.append(lr_mask)
-        pred_points_lr = torch.cat(pred_points_list, dim=0)
-        gt_points_lr = torch.cat(gt_points_list, dim=0)
-        lr_mask = torch.cat(mask_list, dim=0)
-        scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
+    if gt_metric_scale is not None and gt_shift is not None:
+        scale = gt_metric_scale
+        shift = gt_shift
         valid = scale > 0
         scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
     else:
-        raise ValueError(f'Invalid pred_points dimension: {pred_points.dim()}')
+        if pred_points.dim() == 3:
+            # Align
+            (pred_points_lr, gt_points_lr), lr_mask = mask_aware_nearest_resize((pred_points, gt_points), mask=mask, size=(align_resolution, align_resolution))
+            scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
+            valid = scale > 0
+            scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
+        elif pred_points.dim() == 4:
+            pred_points_list, gt_points_list, mask_list = [], [], []
+            for pred_points_i, gt_points_i, mask_i in zip(pred_points, gt_points, mask):
+                # Align
+                (pred_points_lr, gt_points_lr), lr_mask = mask_aware_nearest_resize((pred_points_i, gt_points_i), mask=mask_i, size=(align_resolution, align_resolution))
+                pred_points_list.append(pred_points_lr)
+                gt_points_list.append(gt_points_lr)
+                mask_list.append(lr_mask)
+            pred_points_lr = torch.cat(pred_points_list, dim=0)
+            gt_points_lr = torch.cat(gt_points_list, dim=0)
+            lr_mask = torch.cat(mask_list, dim=0)
+            scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
+            valid = scale > 0
+            scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
+        else:
+            raise ValueError(f'Invalid pred_points dimension: {pred_points.dim()}')
 
     pred_points = scale[..., None, None, None] * pred_points + shift[..., None, None, :]
 
@@ -68,12 +76,7 @@ def affine_invariant_global_loss(
     weight = (valid[..., None, None] & mask).float() / gt_points[..., 2].clamp_min(1e-5)
     weight = weight.clamp_max(10.0 * weighted_mean(weight, mask, dim=(-2, -1), keepdim=True))   # In case your data contains extremely small depth values
     loss = _smooth((pred_points - gt_points).abs() * weight[..., None], beta=beta).mean(dim=(-3, -2, -1))
-    if pred_points.dim() == 4:
-        # pred_points_inter_err = pred_points[1:, ...] * weight[1:, ..., None] - pred_points[:-1, ...] * weight[:-1, ..., None]
-        # gt_points_inter_err = gt_points[1:, ...] * weight[1:, ..., None] - gt_points[:-1, ...] * weight[:-1, ..., None]
-        loss = loss.mean(dim=0)
-        # inter_err = (pred_points_inter_err - gt_points_inter_err).abs().mean(dim=(-4, -3, -2, -1))
-        # loss = loss + inter_err
+
     if sparsity_aware:
         # Reweighting improves performance on sparse depth data. NOTE: this is not used in MoGe-1.
         sparsity = mask.float().mean(dim=(-2, -1)) / lr_mask.float().mean(dim=(-2, -1))
@@ -87,7 +90,7 @@ def affine_invariant_global_loss(
         'delta': weighted_mean((err < 1).float(), mask).item()
     }
 
-    return loss, misc, scale.detach()
+    return loss, misc, scale.detach(), shift.detach()
 
 
 def monitoring(points: torch.Tensor):
@@ -241,10 +244,10 @@ def normal_loss(points: torch.Tensor, gt_points: torch.Tensor, mask: torch.Tenso
     gt_rightxup = torch.cross(gt_rightdown - gt_leftdown, gt_leftup - gt_leftdown, dim=-1)
 
     mask_leftup, mask_rightup, mask_leftdown, mask_rightdown = mask[..., :-1, :-1], mask[..., :-1, 1:], mask[..., 1:, :-1], mask[..., 1:, 1:]
-    mask_upxleft = mask_rightup & mask_leftdown & mask_rightdown
-    mask_leftxdown = mask_leftup & mask_rightdown & mask_rightup
-    mask_downxright = mask_leftdown & mask_rightup & mask_leftup
-    mask_rightxup = mask_rightdown & mask_leftup & mask_leftdown
+    mask_upxleft = mask_rightup & mask_leftdown & mask_rightdown & (upxleft.norm(dim=-1) > 1e-6) & (gt_upxleft.norm(dim=-1) > 1e-6)
+    mask_leftxdown = mask_leftup & mask_rightdown & mask_rightup & (leftxdown.norm(dim=-1) > 1e-6) & (gt_leftxdown.norm(dim=-1) > 1e-6)
+    mask_downxright = mask_leftdown & mask_rightup & mask_leftup & (downxright.norm(dim=-1) > 1e-6) & (gt_downxright.norm(dim=-1) > 1e-6)
+    mask_rightxup = mask_rightdown & mask_leftup & mask_leftdown & (rightxup.norm(dim=-1) > 1e-6) & (gt_rightxup.norm(dim=-1) > 1e-6)
 
     MIN_ANGLE, MAX_ANGLE, BETA_RAD = math.radians(1), math.radians(90), math.radians(3)
 
@@ -253,7 +256,9 @@ def normal_loss(points: torch.Tensor, gt_points: torch.Tensor, mask: torch.Tenso
             + mask_downxright * _smooth(angle_diff_vec3(downxright, gt_downxright).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD) \
             + mask_rightxup * _smooth(angle_diff_vec3(rightxup, gt_rightxup).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD)
 
-    loss = loss.mean() / (4 * max(points.shape[-3:-1]))
+    loss = loss.mean() / (max(points.shape[-3:-1]))
+    # loss = loss.sum() / (mask_upxleft.sum() + mask_leftxdown.sum() + mask_downxright.sum() + mask_rightxup.sum()).clamp(min=1)
+    # loss = loss / 4 
 
     return loss, {}
 
@@ -289,4 +294,9 @@ def mask_l2_loss(pred_mask: torch.Tensor, gt_mask_pos: torch.Tensor, gt_mask_neg
 def mask_bce_loss(pred_mask_prob: torch.Tensor, gt_mask_pos: torch.Tensor, gt_mask_neg: torch.Tensor) -> torch.Tensor:
     loss = (gt_mask_pos | gt_mask_neg) * F.binary_cross_entropy(pred_mask_prob, gt_mask_pos.float(), reduction='none')
     loss = loss.mean(dim=(-2, -1))
+    return loss, {}
+
+def scale_shift_loss(pred_scale: torch.Tensor, pred_shift: torch.Tensor, gt_scale: torch.Tensor, gt_shift: torch.Tensor) -> torch.Tensor:
+    loss = (torch.log(pred_scale) - torch.log(gt_scale)).square() + (pred_shift - gt_shift).square()
+    loss = loss.mean()
     return loss, {}
