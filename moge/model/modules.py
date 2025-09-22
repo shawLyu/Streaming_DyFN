@@ -301,21 +301,80 @@ class ScaleShiftHead(nn.Module):
         x = x.reshape(input_shape[0], input_shape[1], 1)
         return x
 
+class ConvGRUCell(nn.Module):
+    """
+    A GRU Cell with convolutional gates.
+    The state is a feature map [B, C_hidden, H, W].
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3):
+        super(ConvGRUCell, self).__init__()
+        self.hidden_dim = hidden_dim
+        padding = kernel_size // 2
+        
+        # Convolution for the reset and update gates
+        self.conv_gates = nn.Conv2d(
+            in_channels=input_dim + hidden_dim,
+            out_channels=2 * hidden_dim,  # z_t (update) and r_t (reset)
+            kernel_size=kernel_size,
+            padding=padding,
+            padding_mode='replicate'
+        )
+        
+        # Convolution for the candidate hidden state
+        self.conv_candidate = nn.Conv2d(
+            in_channels=input_dim + hidden_dim,
+            out_channels=hidden_dim,  # h_tilde_t
+            kernel_size=kernel_size,
+            padding=padding,
+            padding_mode='replicate'
+        )
 
+    def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_t (torch.Tensor): Input tensor at time t, [B, C_in, H, W]
+            h_prev (torch.Tensor): Hidden state from time t-1, [B, C_hidden, H, W]
+        """
+        # Concatenate input and previous hidden state
+        combined = torch.cat([x_t, h_prev], dim=1)  # [B, C_in + C_hidden, H, W]
+        
+        # Calculate gates
+        gates = self.conv_gates(combined)  # [B, 2 * C_hidden, H, W]
+        
+        # Split gates
+        z_t, r_t = torch.split(gates, self.hidden_dim, dim=1)
+        
+        # Apply activations
+        z_t = torch.sigmoid(z_t)  # Update gate
+        r_t = torch.sigmoid(r_t)  # Reset gate
+        
+        # Calculate candidate hidden state
+        combined_reset = torch.cat([x_t, r_t * h_prev], dim=1)
+        h_tilde_t = torch.tanh(self.conv_candidate(combined_reset))
+        
+        # Calculate new hidden state
+        h_t = (1.0 - z_t) * h_prev + z_t * h_tilde_t
+        
+        return h_t
+
+
+# --- 2. Your Modified RecurrentFeatureStabilizer ---
+
+# (Your original code, with ConvGRUCell merged in)
 class RecurrentFeatureStabilizer(nn.Module):
     """
     A learnable module to stabilize feature statistics over time.
     
-    It uses a GRUCell to maintain a "learnable EMA" of the feature
-    statistics (represented by a hidden state). This hidden state
-    is then used to predict affine parameters (gamma, beta) for
-    an AdaIN-like normalization.
-    """
+    It uses a *ConvGRUCell* to maintain a "learnable EMA" of the feature
+    statistics (represented by a *hidden state map*). This hidden state
+    is then used to predict *spatially-varying* affine parameters (gamma, beta)
+    as a *residual* on top of a *global* EMA baseline.
+    """ # <-- MODIFIED Docstring
     def __init__(self, feature_dim: int, hidden_dim: int, fixed_alpha: float = 0.1, epsilon: float = 1e-5):
         """
         Args:
             feature_dim (int): The number of channels 'd' in the input feature map.
-            hidden_dim (int): The size of the GRU's hidden state.
+            hidden_dim (int): The size of the *ConvGRU's hidden state channels*. # <-- MODIFIED
             epsilon (float): For numerical stability in normalization.
         """
         super().__init__()
@@ -324,22 +383,39 @@ class RecurrentFeatureStabilizer(nn.Module):
         self.epsilon = epsilon
         self.fixed_alpha = fixed_alpha
 
+        # --- Baseline Path (Global EMA) ---
+        # This logic is UNCHANGED.
         self.register_buffer("ema_mean", None, persistent=True)
         self.register_buffer("ema_std", None, persistent=True)
         
-        # The input to the GRU will be the global average pooled (GAP)
-        # feature vector of the current frame.
-        self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=hidden_dim)
+        # --- Correction Path (Local ConvGRU) ---
+        # This path is now spatially-aware.
+        self.gru_cell = ConvGRUCell(
+            input_dim=feature_dim, 
+            hidden_dim=hidden_dim,
+            kernel_size=3
+        ) # <-- MODIFIED (was nn.GRUCell)
         
-        # These heads predict the *delta* (correction)
-        self.gamma_delta_head = nn.Linear(hidden_dim, feature_dim)
-        self.beta_delta_head = nn.Linear(hidden_dim, feature_dim)
+        # These heads predict the *spatially-varying delta* (correction map)
+        self.gamma_delta_head = nn.Conv2d(
+            hidden_dim, 
+            feature_dim, 
+            kernel_size=1
+        ) # <-- MODIFIED (was nn.Linear)
+        self.beta_delta_head = nn.Conv2d(
+            hidden_dim, 
+            feature_dim, 
+            kernel_size=1
+        ) # <-- MODIFIED (was nn.Linear)
         
         # Initialize the delta heads to output zero
         self._init_weights()
 
     def _init_weights(self):
-        """Initializes the delta heads to output zero."""
+        """
+        Initializes the delta heads to output zero.
+        (This function works for both nn.Linear and nn.Conv2d)
+        """
         print("Initializing HybridRecurrentStabilizer: Delta heads set to zero.")
         for head in [self.gamma_delta_head, self.beta_delta_head]:
             nn.init.constant_(head.weight, 0.0)
@@ -349,6 +425,7 @@ class RecurrentFeatureStabilizer(nn.Module):
         """
         Updates the fixed EMA baseline statistics.
         This is the non-learnable "safety net".
+        THIS FUNCTION IS UNCHANGED.
         """
         # Calculate current stats (detached from graph)
         B = x.shape[0]
@@ -372,58 +449,60 @@ class RecurrentFeatureStabilizer(nn.Module):
                 # If batch size is different, just use the first sample
                 # to update the first EMA stat (a reasonable heuristic)
                 self.ema_mean.data[0:B] = (self.fixed_alpha * mu_t + 
-                                        (1 - self.fixed_alpha) * self.ema_mean.data[0:B])
+                                          (1 - self.fixed_alpha) * self.ema_mean.data[0:B])
                 self.ema_std.data[0:B] = (self.fixed_alpha * std_t + 
-                                       (1 - self.fixed_alpha) * self.ema_std.data[0:B])
-
+                                         (1 - self.fixed_alpha) * self.ema_std.data[0:B])
 
         return self.ema_mean, self.ema_std
 
     def forward(self, x: torch.Tensor, prev_state: Optional[torch.Tensor] = None
-                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for one time step.
         
         Args:
             x (torch.Tensor): Current frame's features, shape [B, D, H, W].
-            prev_state (Optional[torch.Tensor]): Previous hidden state from the GRU.
-                                                Shape: [B, hidden_dim].
+            prev_state (Optional[torch.Tensor]): Previous hidden state *map* from ConvGRU.
+                                                 Shape: [B, hidden_dim, H, W]. # <-- MODIFIED comment
         
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
                 - x_stable (torch.Tensor): Stabilized features, [B, D, H, W].
-                - next_state (torch.Tensor): New hidden state, [B, hidden_dim].
+                - next_state (torch.Tensor): New hidden state *map*, [B, hidden_dim, H, W]. # <-- MODIFIED comment
         """
         B, D, H, W = x.shape
         
         # --- 1. Baseline Path ---
-        # Update and get the fixed EMA statistics
+        # This logic is UNCHANGED.
         # mu_base and std_base have shape [B, D]
         mu_base, std_base = self._update_ema_stats(x)
         
         # --- 2. Correction Path (Learnable) ---
-        # Get input for GRU
-        x_pooled = F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1) # [B, D]
+        # x_pooled = F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1) # [B, D] # <-- DELETED
         
         if prev_state is None:
-            prev_state = torch.zeros(B, self.hidden_dim, dtype=x.dtype, device=x.device)
+            prev_state = torch.zeros(B, self.hidden_dim, H, W, dtype=x.dtype, device=x.device) # <-- MODIFIED (is 4D map)
             
-        # Update the hidden state
-        next_state = self.gru_cell(x_pooled, prev_state)
+        # Update the hidden state *map*
+        next_state = self.gru_cell(x, prev_state) # <-- MODIFIED (input is x, not x_pooled)
         
-        # Predict the *correction* (delta)
-        # These have shape [B, D]
-        gamma_delta = self.gamma_delta_head(next_state)
-        beta_delta = self.beta_delta_head(next_state)
+        # Predict the *spatially-varying correction* (delta map)
+        # These now have shape [B, D, H, W]
+        gamma_delta = self.gamma_delta_head(next_state) # <-- MODIFIED (output is 4D map)
+        beta_delta = self.beta_delta_head(next_state)   # <-- MODIFIED (output is 4D map)
         
         # --- 3. Combine Paths ---
-        # Add the baseline and the correction
-        # We must clamp gamma to be positive
-        gamma_final = torch.clamp(std_base + gamma_delta, min=self.epsilon)
-        beta_final = mu_base + beta_delta
+        # Broadcast global baseline [B, D] -> [B, D, 1, 1]
+        std_base_bcast = std_base.unsqueeze(-1).unsqueeze(-1) # <-- NEW
+        mu_base_bcast = mu_base.unsqueeze(-1).unsqueeze(-1)  # <-- NEW
+
+        # Add the baseline (broadcasted) and the correction (local map)
+        gamma_final = torch.clamp(std_base_bcast + gamma_delta, min=self.epsilon) # <-- MODIFIED
+        beta_final = mu_base_bcast + beta_delta # <-- MODIFIED
         
         # --- 4. Apply Normalization ---
-        # Calculate current frame's stats (Instance Norm part)
+        # This logic is UNCHANGED.
+        # We still use global Instance Norm for the base normalization.
         mu_x = torch.mean(x, dim=[2, 3], keepdim=True)  # [B, D, 1, 1]
         std_x = torch.std(x, dim=[2, 3], keepdim=True)   # [B, D, 1, 1]
         
@@ -431,10 +510,11 @@ class RecurrentFeatureStabilizer(nn.Module):
         x_norm = (x - mu_x) / (std_x + self.epsilon)
         
         # Reshape gamma/beta for broadcasting: [B, D] -> [B, D, 1, 1]
-        gamma_final = gamma_final.unsqueeze(-1).unsqueeze(-1)
-        beta_final = beta_final.unsqueeze(-1).unsqueeze(-1)
+        # gamma_final = gamma_final.unsqueeze(-1).unsqueeze(-1) # <-- DELETED (gamma_final is already 4D)
+        # beta_final = beta_final.unsqueeze(-1).unsqueeze(-1)  # <-- DELETED (beta_final is already 4D)
         
-        # Apply combined scale and shift
+        # Apply combined (and now spatially-varying) scale and shift
+        # This is now [B,D,H,W] * [B,D,H,W] + [B,D,H,W]
         x_stable = gamma_final * x_norm + beta_final
         
         return x_stable, next_state

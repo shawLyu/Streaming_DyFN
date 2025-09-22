@@ -13,8 +13,8 @@ accelerate launch \
     --config $CFG \
     --workspace $WORKSPACE \
     --gradient_accumulation_steps 1 \
-    --batch_size_forward 1 \
-    --checkpoint pretrained_moge/pretrained_moge.pt \
+    --batch_size_forward 4 \
+    --checkpoint pretrained_moge/pretrained_w_normal_reg.pt \
     --enable_gradient_checkpointing False \
     --vis_every 500 \
     --enable_mlflow True \

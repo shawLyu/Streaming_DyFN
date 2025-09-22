@@ -134,8 +134,8 @@ def main(
     import warnings
     warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
     
-    # for name, param in model.backbone.named_parameters():
-    #     param.requires_grad = False
+    for name, param in model.backbone.named_parameters():
+        param.requires_grad = False
 
     # Initalize optimizer & lr scheduler
     optimizer = build_optimizer(model, config['optimizer'])

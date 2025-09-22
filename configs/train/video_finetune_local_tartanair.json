@@ -10,21 +10,68 @@
         "sampled_sequence_length": 12,
         "datasets": [ 
             {
+                "name": "dynamic_replica",
+                "path": "data/moge_process_dataset/dynamic_replica",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 5.0,
+                "center_augmentation": 0.25
+            },
+            {
+                "name": "irs",
+                "path": "data/moge_process_dataset/irs",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 5.8,
+                "center_augmentation": 0.25
+            },
+            {
+                "name": "kenburn3d",
+                "path": "data/moge_process_dataset/kenburn3d",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 1.6
+            },
+            {
+                "name": "spring",
+                "path": "data/moge_process_dataset/spring",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 0.7,
+                "fov_range_absolute": [60, 120],
+                "image_augmentation": ["jittering", "jpeg_loss", "blurring"]
+            },
+            {
                 "name": "tartanair",
                 "path": "data/moge_process_dataset/tartanair",
                 "label_type": "synthetic",
                 "index": "index.txt",
                 "depth": "depth.png",
                 "weight": 5.0,
-                "center_augmentation": 0.0,
-                "fov_range_absolute": [80, 100],
-                "fov_range_relative": [0.5, 1.0]
+                "center_augmentation": 0.25,
+                "fov_range_absolute": [30, 150],
+                "fov_range_relative": [0.5, 1.0],
+                "image_augmentation": ["jittering", "jpeg_loss", "blurring", "shot_noise"]
+            },
+            {
+                "name": "midair",
+                "path": "data/moge_process_dataset/midair",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 2.7,
+                "fov_range_absolute": [60, 120],
+                "image_augmentation": ["jittering", "jpeg_loss", "blurring", "shot_noise"]
             }
         ]
     },
     "model_version": "v1",
     "model": {
-        "encoder": "dinov2_vitl14",
+        "encoder": "dinov2_vitl14_reg",
         "remap_output": "exp",
         "intermediate_layers": 4,
         "dim_upsample": [256, 128, 64],
@@ -37,15 +84,15 @@
     "optimizer": {
         "type": "AdamW",
         "params": [
-            {"params": {"include": ["*stabilizer.*"], "lr": 1e-4}},
-            {"params": {"include": ["*head.*"], "exclude": ["*stabilizer.*"]}, "lr": 1e-6}
+            {"params": {"include": ["*stabilizer.*"], "lr": 1e-3}},
+            {"params": {"include": ["*head.*"], "exclude": ["*stabilizer.*"]}, "lr": 0.0}
         ]
     },
     "lr_scheduler": {
         "type": "SequentialLR",
         "params": {
             "schedulers": [
-                {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "max(0.0, min(1.0, (epoch - 1000) / 1000))"]}},
+                {"type": "LambdaLR", "params": {"lr_lambda": ["1.0", "1.0"]}},
                 {"type": "StepLR", "params": {"step_size": 5000, "gamma": 0.5}}
             ],
             "milestones": [1000]

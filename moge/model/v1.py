@@ -84,7 +84,8 @@ class Head(nn.Module):
         hidden_states: torch.Tensor, 
         image: torch.Tensor, 
         prev_state: Optional[torch.Tensor] = None,
-        batch_size: int = 1
+        batch_size: int = 1,
+        inference_mode: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for a single frame in a sequence, using the
@@ -111,18 +112,23 @@ class Head(nn.Module):
             proj(feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous())
                 for proj, (feat, clstoken) in zip(self.projects, hidden_states)
         ], dim=1).sum(dim=1)
-        
-        feature_after_stabilizer = []
 
-        x = x.reshape(batch_size, -1, *x.shape[1:]).permute(1, 0, 2, 3, 4)
-        # --- Apply Recurrent Stabilizer ---
-        for i in range(x.shape[0]):
-            stabilized_feature, prev_state = self.stabilizer(x[i], prev_state)
-            feature_after_stabilizer.append(stabilized_feature[:, None, ...])
-        self.stabilizer.ema_mean = None
-        self.stabilizer.ema_std = None
-        x = torch.cat(feature_after_stabilizer, dim=1)
-        x = x.reshape(-1, *x.shape[2:])
+        features_before_stabilizer = x.clone()
+        if not inference_mode:
+            feature_after_stabilizer = []
+            x = x.reshape(batch_size, -1, *x.shape[1:]).permute(1, 0, 2, 3, 4)
+            # --- Apply Recurrent Stabilizer ---
+            for i in range(x.shape[0]):
+                stabilized_feature, prev_state = self.stabilizer(x[i], prev_state)
+                feature_after_stabilizer.append(stabilized_feature[:, None, ...])
+            self.stabilizer.ema_mean = None
+            self.stabilizer.ema_std = None
+            x = torch.cat(feature_after_stabilizer, dim=1)
+            x = x.reshape(-1, *x.shape[2:])
+        else:
+            x, prev_state = self.stabilizer(x, prev_state)
+        features_after_stabilizer = x.clone()
+
 
         # --- Upsample stage (Identical to your simple 'forward' method) ---
         for i, block in enumerate(self.upsample_blocks):
@@ -143,7 +149,10 @@ class Head(nn.Module):
         else:
             output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
         
-        return output, prev_state
+        if inference_mode:
+            return output, prev_state, features_before_stabilizer, features_after_stabilizer
+        else:
+            return output, prev_state
             
             
     def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, memory_banks: List[torch.Tensor] = None):
@@ -405,7 +414,6 @@ class MoGeModel(nn.Module):
         img_h, img_w = image.shape[-2:]
         patch_h, patch_w = img_h // 14, img_w // 14
 
-        memory_banks = []
         points_list = []
         masks_list = []
         feature_list = []
@@ -415,35 +423,31 @@ class MoGeModel(nn.Module):
         prev_state = None
         feats = [[] for _ in range(self.intermediate_layers)]
         cls_tokens = [[] for _ in range(self.intermediate_layers)]
+        features_before_stabilizer_list = []
+        features_after_stabilizer_list = []
         for i in tqdm(range(image_14.shape[0]), desc="Processing frames"):
             features = self.backbone.get_intermediate_layers(image_14[i][None, ...], self.intermediate_layers, return_class_token=True)
-            for j in range(self.intermediate_layers):
-                feats[j].append(features[j][0])
-                cls_tokens[j].append(features[j][1])
-        feats = [torch.concat(feat, dim=0) for feat in feats]
-        cls_tokens = [torch.concat(cls_token, dim=0) for cls_token in cls_tokens]
-        features = tuple(zip(feats, cls_tokens))
-
-        # output, feature_after_temporal_attention, feature_before_temporal_attention = self.head.forward_with_memory(features, image, memory_banks)
-        output, prev_state = self.head.forward_recurrent(features, image, prev_state)
-        points, mask = output
+            output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state, inference_mode=True)
+            features_before_stabilizer_list.append(features_before_stabilizer)
+            features_after_stabilizer_list.append(features_after_stabilizer)
+            points, mask = output
     
-        # Make sure fp32 precision for output
-        with torch.autocast(device_type=image.device.type, dtype=torch.float32):
-            # Resize to original resolution
-            points = F.interpolate(points, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
-            mask = F.interpolate(mask, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
-            
-            # Post-process points and mask
-            points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
-            points = self._remap_points(points)     # slightly improves the performance in case of very large output values
-            # points_list.append(points)
-            # masks_list.append(mask)
-            # feature_after_temporal_attention_list.append(feature_after_temporal_attention)
-            # feature_before_tempoal_attention_list.append(feature_before_temporal_attention)
+            # Make sure fp32 precision for output
+            with torch.autocast(device_type=image.device.type, dtype=torch.float32):
+                # Resize to original resolution
+                points = F.interpolate(points, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
+                mask = F.interpolate(mask, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
+                
+                # Post-process points and mask
+                points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
+                points = self._remap_points(points)     # slightly improves the performance in case of very large output values
+                points_list.append(points)
+                masks_list.append(mask)
         
-        # points = torch.concat(points_list, dim=0)
-        # mask = torch.concat(masks_list, dim=0)
+        features_before_stabilizer_list = torch.concat(features_before_stabilizer_list, dim=0)
+        features_after_stabilizer_list = torch.concat(features_after_stabilizer_list, dim=0)
+        points = torch.concat(points_list, dim=0)
+        mask = torch.concat(masks_list, dim=0)
 
         mask_binary = mask > self.mask_threshold
 
@@ -479,8 +483,8 @@ class MoGeModel(nn.Module):
             'depth': depth,
             'mask': mask_binary,
             'mask_prob': torch.sigmoid(mask),
-            # 'feature_after_temporal_attention': feature_after_temporal_attention_list,
-            # 'feature_before_temporal_attention': feature_before_temporal_attention_list,
+            'feature_after_temporal_attention': features_after_stabilizer_list,
+            'feature_before_temporal_attention': features_before_stabilizer_list,
         }
 
         return return_dict

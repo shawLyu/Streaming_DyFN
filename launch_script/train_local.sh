@@ -1,5 +1,5 @@
-source /home/luban/miniconda3/etc/profile.d/conda.sh
-conda activate video_depth
+# source /home/luban/miniconda3/etc/profile.d/conda.sh
+# conda activate video_depth
 
 CFG=${1:-"configs/train/video_finetune_local_tartanair.json"}
 
@@ -10,7 +10,7 @@ accelerate launch \
     moge/scripts/train.py \
     --config $CFG \
     --workspace $WORKSPACE \
-    --checkpoint pretrained_moge/pretrained_moge.pt \
+    --checkpoint pretrained_moge/pretrained_w_normal_reg.pt \
     --gradient_accumulation_steps 1 \
     --batch_size_forward 2 \
     --enable_gradient_checkpointing False \

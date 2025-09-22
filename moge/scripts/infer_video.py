@@ -43,6 +43,18 @@ def read_video_frames(video_path, target_fps, max_res):
     frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
     return frames, fps
 
+def compute_svd_raw(feature):
+    """Compute top-3 singular vectors of feature map (not normalized)."""
+    c, h, w = feature.shape
+    feature_2d = feature.reshape(c, -1)
+
+    _, _, vh = np.linalg.svd(feature_2d, full_matrices=False)
+
+    comps = [vh[i].reshape(h, w) for i in range(3)]  # raw values
+    return np.stack(comps, axis=-1)  # (H, W, 3)
+
+def normalize_svd(svd_img, vmin, vmax):
+    return (svd_img - vmin) / (vmax - vmin + 1e-8)
 
 
 @click.command(help='Video Depth Inference Demo')
@@ -92,11 +104,10 @@ def main(
 
     model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
 
-    # frames = frames[:, 10:-10, 10:-10, :]
-    frames = frames[:60, :, :, :]
-
     height, width = frames.shape[1:3]
 
+    feats_before_svd = []
+    feats_after_svd = []
     with torch.no_grad():
         # Use sliding window of size 3 with stride 1
         image_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).to(device)
@@ -107,16 +118,24 @@ def main(
         depth = output['depth'].cpu().numpy()
         mask = output['mask'].cpu().numpy()
         intrinsics = output['intrinsics'].cpu().numpy()
+        feature_after_temporal_attention = output['feature_after_temporal_attention'].cpu().numpy()
+        feature_before_temporal_attention = output['feature_before_temporal_attention'].cpu().numpy()
+
+        for feat_before, feat_after in zip(feature_before_temporal_attention, feature_after_temporal_attention):
+            feat_before_svd = compute_svd_raw(feat_before)
+            feat_after_svd = compute_svd_raw(feat_after)
+            feats_before_svd.append(feat_before_svd)
+            feats_after_svd.append(feat_after_svd)
         # Prepare the depth visualization
         depth = np.where((depth > 0) & mask, depth, np.nan)
-        disp_preds = 1 / depth
+        disp_preds = depth
 
         frames_output_dir = Path(output_dir, "frames")
         save_path = Path(frames_output_dir, Path(video_path).stem)
         save_path.mkdir(exist_ok=True, parents=True)
 
         normals_list = []
-        for i, frame in tqdm(enumerate(frames), total=len(frames), desc="Processing frames"):
+        for i, frame in tqdm(enumerate(frames), total=len(frames), desc="Processing saved frames"):
             normals, normals_mask = utils3d.numpy.points_to_normals(points[i], mask=mask[i])
             normals_list.append(colorize_normal(normals))
             if save_ply_:
@@ -150,15 +169,45 @@ def main(
     depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp)
     normals = np.stack(normals_list, axis=0)
 
+    global_min_before_svd = min(arr.min() for arr in feats_before_svd)
+    global_max_before_svd = max(arr.max() for arr in feats_before_svd)
+    global_min_after_svd = min(arr.min() for arr in feats_after_svd)
+    global_max_after_svd = max(arr.max() for arr in feats_after_svd)
+
+    feats_before_svd = [normalize_svd(arr, global_min_before_svd, global_max_before_svd) for arr in feats_before_svd]
+    feats_after_svd = [normalize_svd(arr, global_min_after_svd, global_max_after_svd) for arr in feats_after_svd]
+
     if save_video:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        # Save the visualized results
+        # Prepare visualizations
         depth_preds_color = np.stack(depth_preds_color, axis=0)
         frames_np = (frames * 255).astype(np.uint8)
-        combined_video = np.concatenate([frames_np, depth_preds_color, normals], axis=1)
+        # Replace normals_np with feats_after_svd visualization
+        # Visualize features (use feats_before_svd as example, shape: [N, C, H, W])
+        # We'll take the first 3 channels and normalize to [0,255] for visualization
+        feats_vis_before = []
+        for arr in feats_before_svd:
+            # arr: [C, H, W], take first 3 channels, normalize to [0,255]
+            arr_vis = cv2.resize(arr, (frames_np.shape[2], frames_np.shape[1]))
+            arr_vis = (arr_vis * 255).clip(0, 255).astype(np.uint8)
+            feats_vis_before.append(arr_vis)
+        feats_vis_before = np.stack(feats_vis_before, axis=0)
+
+        feats_vis_after = []
+        for arr in feats_after_svd:
+            arr_vis = cv2.resize(arr, (frames_np.shape[2], frames_np.shape[1]))
+            arr_vis = (arr_vis * 255).clip(0, 255).astype(np.uint8)
+            feats_vis_after.append(arr_vis)
+        feats_vis_after = np.stack(feats_vis_after, axis=0)
+
+        # 2x2 grid: [frame | depth]
+        #           [feats_after| feats_before]
+        top_row = np.concatenate([frames_np, depth_preds_color], axis=2)
+        bottom_row = np.concatenate([feats_vis_after, feats_vis_before], axis=2)
+        grid_video = np.concatenate([top_row, bottom_row], axis=1)
+
         video_name = Path(video_path).stem
         output_path = os.path.join(output_dir, f'{video_name}_depth.mp4')
-        mediapy.write_video(output_path, combined_video, fps=10, crf=18)
-
+        mediapy.write_video(output_path, grid_video, fps=10, crf=18)
 if __name__ == '__main__':
     main()
