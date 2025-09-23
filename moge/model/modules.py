@@ -358,6 +358,156 @@ class ConvGRUCell(nn.Module):
         return h_t
 
 
+class RecurrentFeatureStabilizerGRU(nn.Module):
+    """
+    A learnable module to stabilize feature statistics over time.
+
+    It uses a GRUCell to maintain a "learnable EMA" of the feature
+    statistics (represented by a hidden state). This hidden state
+    is then used to predict affine parameters (gamma, beta) for
+    an AdaIN-like normalization.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_dim: int,
+        fixed_alpha: float = 0.1,
+        epsilon: float = 1e-5,
+    ):
+        """
+        Args:
+            feature_dim (int): The number of channels 'd' in the input feature map.
+            hidden_dim (int): The size of the GRU's hidden state.
+            epsilon (float): For numerical stability in normalization.
+        """
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.epsilon = epsilon
+        self.fixed_alpha = fixed_alpha
+
+        self.register_buffer("ema_mean", None, persistent=True)
+        self.register_buffer("ema_std", None, persistent=True)
+
+        # The input to the GRU will be the global average pooled (GAP)
+        # feature vector of the current frame.
+        self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=hidden_dim)
+
+        # These heads predict the *delta* (correction)
+        self.gamma_delta_head = nn.Linear(hidden_dim, feature_dim)
+        self.beta_delta_head = nn.Linear(hidden_dim, feature_dim)
+
+        # Initialize the delta heads to output zero
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initializes the delta heads to output zero."""
+        print("Initializing HybridRecurrentStabilizer: Delta heads set to zero.")
+        for head in [self.gamma_delta_head, self.beta_delta_head]:
+            nn.init.constant_(head.weight, 0.0)
+            nn.init.constant_(head.bias, 0.0)
+
+    def _update_ema_stats(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the fixed EMA baseline statistics.
+        This is the non-learnable "safety net".
+        """
+        # Calculate current stats (detached from graph)
+        B = x.shape[0]
+        mu_t = torch.mean(x, dim=[2, 3], keepdim=False).detach()  # [B, D]
+        std_t = torch.std(x, dim=[2, 3], keepdim=False).detach()  # [B, D]
+
+        if self.ema_mean is None:
+            # First frame
+            self.ema_mean = mu_t.clone()
+            self.ema_std = std_t.clone()
+        else:
+            # Apply fixed EMA update
+            # We must update the buffer data directly
+            # Handle potential batch size mismatches (e.g., last batch)
+            if B == self.ema_mean.shape[0]:
+                self.ema_mean.data = (
+                    self.fixed_alpha * mu_t + (1 - self.fixed_alpha) * self.ema_mean.data
+                )
+                self.ema_std.data = (
+                    self.fixed_alpha * std_t + (1 - self.fixed_alpha) * self.ema_std.data
+                )
+            else:
+                # If batch size is different, just use the first sample
+                # to update the first EMA stat (a reasonable heuristic)
+                self.ema_mean.data[0:B] = (
+                    self.fixed_alpha * mu_t + (1 - self.fixed_alpha) * self.ema_mean.data[0:B]
+                )
+                self.ema_std.data[0:B] = (
+                    self.fixed_alpha * std_t + (1 - self.fixed_alpha) * self.ema_std.data[0:B]
+                )
+        return self.ema_mean, self.ema_std
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        prev_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for one time step.
+
+        Args:
+            x (torch.Tensor): Current frame's features, shape [B, D, H, W].
+            prev_state (Optional[torch.Tensor]): Previous hidden state from the GRU.
+                                                Shape: [B, hidden_dim].
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - x_stable (torch.Tensor): Stabilized features, [B, D, H, W].
+                - next_state (torch.Tensor): New hidden state, [B, hidden_dim].
+        """
+        B, D, H, W = x.shape
+
+        # --- 1. Baseline Path ---
+        # Update and get the fixed EMA statistics
+        # mu_base and std_base have shape [B, D]
+        mu_base, std_base = self._update_ema_stats(x)
+
+        # --- 2. Correction Path (Learnable) ---
+        # Get input for GRU
+        # [B, D]
+        x_pooled = F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1)
+
+        if prev_state is None:
+            prev_state = torch.zeros(B, self.hidden_dim, dtype=x.dtype, device=x.device)
+
+        # Update the hidden state
+        next_state = self.gru_cell(x_pooled, prev_state)
+
+        # Predict the *correction* (delta)
+        # These have shape [B, D]
+        gamma_delta = self.gamma_delta_head(next_state)
+        beta_delta = self.beta_delta_head(next_state)
+
+        # --- 3. Combine Paths ---
+        # Add the baseline and the correction
+        # We must clamp gamma to be positive
+        gamma_final = torch.clamp(std_base + gamma_delta, min=self.epsilon)
+        beta_final = mu_base + beta_delta
+
+        # --- 4. Apply Normalization ---
+        # Calculate current frame's stats (Instance Norm part)
+        mu_x = torch.mean(x, dim=[2, 3], keepdim=True)  # [B, D, 1, 1]
+        std_x = torch.std(x, dim=[2, 3], keepdim=True)  # [B, D, 1, 1]
+
+        # Normalize
+        x_norm = (x - mu_x) / (std_x + self.epsilon)
+
+        # Reshape gamma/beta for broadcasting: [B, D] -> [B, D, 1, 1]
+        gamma_final = gamma_final.unsqueeze(-1).unsqueeze(-1)
+        beta_final = beta_final.unsqueeze(-1).unsqueeze(-1)
+
+        # Apply combined scale and shift
+        x_stable = gamma_final * x_norm + beta_final
+
+        return x_stable, next_state
+
 # --- 2. Your Modified RecurrentFeatureStabilizer ---
 
 # (Your original code, with ConvGRUCell merged in)

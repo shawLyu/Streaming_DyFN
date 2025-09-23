@@ -41,6 +41,7 @@ class Head(nn.Module):
         last_conv_channels: int = 32,
         last_conv_size: int = 1,
         stabilizer_hidden_dim: int = 256,
+        stabilizer_type: Literal['GRU', 'ConvGRU'] = 'ConvGRU',
     ):
         super().__init__()
         
@@ -61,7 +62,12 @@ class Head(nn.Module):
             ) for dim_out_ in dim_out
         ])
 
-        self.stabilizer = RecurrentFeatureStabilizer(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
+        if stabilizer_type == 'GRU':
+            self.stabilizer = RecurrentFeatureStabilizerGRU(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
+        elif stabilizer_type == 'ConvGRU':
+            self.stabilizer = RecurrentFeatureStabilizer(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
+        else:
+            raise ValueError(f"Invalid stabilizer type: {stabilizer_type}")
     
     def _make_upsampler(self, in_channels: int, out_channels: int):
         upsampler = nn.Sequential(
@@ -207,6 +213,7 @@ class MoGeModel(nn.Module):
         last_conv_channels: int = 32,
         last_conv_size: int = 1,
         mask_threshold: float = 0.5,
+        stabilizer_type: Literal['GRU', 'ConvGRU'] = 'GRU',
         **deprecated_kwargs
     ):
         super(MoGeModel, self).__init__()
@@ -243,7 +250,8 @@ class MoGeModel(nn.Module):
             res_block_norm=res_block_norm,
             last_res_blocks=last_res_blocks,
             last_conv_channels=last_conv_channels,
-            last_conv_size=last_conv_size 
+            last_conv_size=last_conv_size,
+            stabilizer_type=stabilizer_type
         )
 
         # self.scale_shift_head = ScaleShiftHead(dim_in=dim_feature)

@@ -79,7 +79,8 @@
         "num_res_blocks": 2,
         "num_tokens_range": [1200, 2500],
         "last_conv_channels": 32,
-        "last_conv_size": 1
+        "last_conv_size": 1,
+        "stabilizer_type": "GRU"
     },
     "optimizer": {
         "type": "AdamW",
