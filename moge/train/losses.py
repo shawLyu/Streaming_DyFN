@@ -67,6 +67,7 @@ def affine_invariant_global_loss(
             scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
             valid = scale > 0
             scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
+            return scale, shift
         else:
             raise ValueError(f'Invalid pred_points dimension: {pred_points.dim()}')
 
