@@ -316,44 +316,55 @@ def main(
                     loss_list, weight_list = [], []
                     gt_metric_scale = None
                     gt_shift = None
-                    for i in range(current_batch_size):
-                        loss_dict, weight_dict, misc_dict = {}, {}, {}
-                        misc_dict['monitoring'] = monitoring(pred_points[i])
-                        for k, v in config['loss'][label_type[i]].items():
-                            weight_dict[k] = v['weight']
-                            if v['function'] == 'affine_invariant_global_loss':
-                                loss_dict[k], misc_dict[k], gt_metric_scale, gt_shift = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'])
-                                # loss_dict[k], misc_dict[k], _, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=None, gt_shift=None)
-                            elif v['function'] == 'affine_invariant_local_loss':
-                                loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
-                            elif v['function'] == 'normal_loss':
-                                loss_dict[k], misc_dict[k] = normal_loss(pred_points[i], gt_points[i], gt_mask[i])
-                            elif v['function'] == 'edge_loss':
-                                loss_dict[k], misc_dict[k] = edge_loss(pred_points[i], gt_points[i], gt_mask[i])
-                            elif v['function'] == 'mask_bce_loss':
-                                loss_dict[k], misc_dict[k] = mask_bce_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
-                            elif v['function'] == 'mask_l2_loss':
-                                loss_dict[k], misc_dict[k] = mask_l2_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
-                            else:
-                                raise ValueError(f'Undefined loss function: {v["function"]}')
-                        weight_dict = {'.'.join(k): v for k, v in flatten_nested_dict(weight_dict).items()}
-                        loss_dict = {'.'.join(k): v for k, v in flatten_nested_dict(loss_dict).items()}
-                        loss_ = sum([weight_dict[k] * loss_dict[k] for k in loss_dict], start=torch.tensor(0.0, device=device))
-                        # if loss_ > 1.0 and accelerator.is_main_process and i_step > 100:
-                            # pbar.write(str(loss_dict))
-                            # pbar.write(str(batch['info'][i]))
-                        loss_list.append(loss_)
+                    for b in range(current_batch_size):
+                        if label_type[b*sequence_length] == 'invalid':
+                            continue
+                        sequence_pred_points_b = pred_points[b * sequence_length:(b + 1) * sequence_length]
+                        sequence_gt_points_b = gt_points[b * sequence_length:(b + 1) * sequence_length]
+                        sequence_gt_mask_b = gt_mask[b * sequence_length:(b + 1) * sequence_length]
+                        gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
+                                                    sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
+                        for j in range(sequence_length):
+                            i = b * sequence_length + j
+                            loss_dict, weight_dict, misc_dict = {}, {}, {}
+                            misc_dict['monitoring'] = monitoring(pred_points[i])
+                            for k, v in config['loss'][label_type[i]].items():
+                                weight_dict[k] = v['weight']
+                                if v['function'] == 'affine_invariant_global_loss':
+                                    # NOTE: Adopt the global scale and shift for the local loss
+                                    # TODO: add the option here
+                                    loss_dict[k], misc_dict[k], gt_metric_scale, gt_shift = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=gt_metric_scale_b, gt_shift=gt_shift_b)
+                                    # loss_dict[k], misc_dict[k], _, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=None, gt_shift=None)
+                                elif v['function'] == 'affine_invariant_local_loss':
+                                    loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
+                                elif v['function'] == 'normal_loss':
+                                    loss_dict[k], misc_dict[k] = normal_loss(pred_points[i], gt_points[i], gt_mask[i])
+                                elif v['function'] == 'edge_loss':
+                                    loss_dict[k], misc_dict[k] = edge_loss(pred_points[i], gt_points[i], gt_mask[i])
+                                elif v['function'] == 'mask_bce_loss':
+                                    loss_dict[k], misc_dict[k] = mask_bce_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
+                                elif v['function'] == 'mask_l2_loss':
+                                    loss_dict[k], misc_dict[k] = mask_l2_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
+                                else:
+                                    raise ValueError(f'Undefined loss function: {v["function"]}')
+                            weight_dict = {'.'.join(k): v for k, v in flatten_nested_dict(weight_dict).items()}
+                            loss_dict = {'.'.join(k): v for k, v in flatten_nested_dict(loss_dict).items()}
+                            loss_ = sum([weight_dict[k] * loss_dict[k] for k in loss_dict], start=torch.tensor(0.0, device=device))
+                            # if loss_ > 1.0 and accelerator.is_main_process and i_step > 100:
+                                # pbar.write(str(loss_dict))
+                                # pbar.write(str(batch['info'][i]))
+                            loss_list.append(loss_)
                         
-                        if torch.isnan(loss_).item():
-                            pbar.write(f'NaN loss in process {accelerator.process_index}')
-                            pbar.write(str(loss_dict))
-                            pbar.write(str(batch['info'][i]))
+                            if torch.isnan(loss_).item():
+                                pbar.write(f'NaN loss in process {accelerator.process_index}')
+                                pbar.write(str(loss_dict))
+                                pbar.write(str(batch['info'][i]))
 
-                        misc_dict = {'.'.join(k): v for k, v in flatten_nested_dict(misc_dict).items()}
-                        records.append({
-                            **{k: v.item() for k, v in loss_dict.items()},
-                            **misc_dict,
-                        })
+                            misc_dict = {'.'.join(k): v for k, v in flatten_nested_dict(misc_dict).items()}
+                            records.append({
+                                **{k: v.item() for k, v in loss_dict.items()},
+                                **misc_dict,
+                            })
 
                     loss = sum(loss_list) / len(loss_list)
                     

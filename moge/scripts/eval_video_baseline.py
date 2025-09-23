@@ -64,7 +64,7 @@ def read_video_frames(video_path, target_fps, max_res):
 
 @click.command(help='Evaluate video results')
 # @click.option('--eval_dataset_list', type=list[str], default=['sintel', 'scannet', 'KITTI', 'bonn', 'NYUv2'], help='List of datasets to evaluate')
-@click.option('--eval_dataset_list', type=list[str], default=['scannet'], help='List of datasets to evaluate')
+@click.option('--eval_dataset_list', type=list[str], default=['bonn'], help='List of datasets to evaluate')
 @click.option('--video_dir_path', type=click.Path(exists=True), required=True, help='Path to evaluated video file')
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')
 @click.option('--output_dir', type=click.Path(), default='outputs_video', help='Directory to save output results')
@@ -93,6 +93,7 @@ def main(
     use_fp16: bool,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
     depth_max = {"sintel": 70, "scannet": 10, "KITTI": 80, "bonn": 10, "NYUv2": 10}
