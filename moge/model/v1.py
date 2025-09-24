@@ -213,7 +213,7 @@ class MoGeModel(nn.Module):
         last_conv_channels: int = 32,
         last_conv_size: int = 1,
         mask_threshold: float = 0.5,
-        stabilizer_type: Literal['GRU', 'ConvGRU'] = 'GRU',
+        stabilizer_type: Literal['GRU', 'ConvGRU'] = 'ConvGRU',
         **deprecated_kwargs
     ):
         super(MoGeModel, self).__init__()
@@ -421,6 +421,8 @@ class MoGeModel(nn.Module):
 
         img_h, img_w = image.shape[-2:]
         patch_h, patch_w = img_h // 14, img_w // 14
+        self.head.stabilizer.ema_mean = None
+        self.head.stabilizer.ema_std = None
 
         points_list = []
         masks_list = []
