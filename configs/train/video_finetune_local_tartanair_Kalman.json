@@ -7,7 +7,7 @@
         "fov_range_absolute": [30, 150],
         "fov_range_relative": [0.5, 1.0],
         "image_augmentation": ["jittering", "jpeg_loss", "blurring"],
-        "sampled_sequence_length": 12,
+        "sampled_sequence_length": 8,
         "datasets": [ 
             {
                 "name": "dynamic_replica",
@@ -80,7 +80,7 @@
         "num_tokens_range": [1200, 2500],
         "last_conv_channels": 32,
         "last_conv_size": 1,
-        "stabilizer_type": "ConvGRU"
+        "stabilizer_type": "Kalman"
     },
     "optimizer": {
         "type": "AdamW",
@@ -107,7 +107,7 @@
             "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
             "patch_16": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 16, "align_resolution": 8, "num_patches": 256}},
             "patch_64": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 64, "align_resolution": 4, "num_patches": 4096}},
-            "normal": {"function": "normal_loss", "weight": 5.0},
+            "normal": {"function": "normal_loss", "weight": 1.0},
             "mask": {"function": "mask_l2_loss", "weight": 1.0}
         },
         "sfm": {

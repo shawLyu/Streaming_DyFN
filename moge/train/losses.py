@@ -67,7 +67,7 @@ def affine_invariant_global_loss(
             scale, shift = align_points_scale_z_shift(pred_points_lr.flatten(-3, -2), gt_points_lr.flatten(-3, -2), lr_mask.flatten(-2, -1) / gt_points_lr[..., 2].flatten(-2, -1).clamp_min(1e-2), trunc=trunc)
             valid = scale > 0
             scale, shift = torch.where(valid, scale, 0), torch.where(valid[..., None], shift, 0)
-            return scale, shift
+            return scale.detach(), shift.detach()
         else:
             raise ValueError(f'Invalid pred_points dimension: {pred_points.dim()}')
 
@@ -257,7 +257,7 @@ def normal_loss(points: torch.Tensor, gt_points: torch.Tensor, mask: torch.Tenso
             + mask_downxright * _smooth(angle_diff_vec3(downxright, gt_downxright).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD) \
             + mask_rightxup * _smooth(angle_diff_vec3(rightxup, gt_rightxup).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD)
 
-    loss = loss.mean() / (max(points.shape[-3:-1]))
+    loss = loss.mean() / (4 * max(points.shape[-3:-1]))
     # loss = loss.sum() / (mask_upxleft.sum() + mask_leftxdown.sum() + mask_downxright.sum() + mask_rightxup.sum()).clamp(min=1)
     # loss = loss / 4 
 

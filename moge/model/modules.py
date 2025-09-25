@@ -668,3 +668,100 @@ class RecurrentFeatureStabilizer(nn.Module):
         x_stable = gamma_final * x_norm + beta_final
         
         return x_stable, next_state
+
+
+class KalmanRecurrentStabilizer(nn.Module):
+    """
+    A normalization module inspired by the Kalman Filter equations.
+    This version explicitly uses the current frame's statistics (mu, std)
+    as input for estimating the measurement noise (R).
+    """
+    
+    def __init__(self, feature_dim: int, hidden_dim: int, epsilon: float = 1e-5):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.epsilon = epsilon
+
+        # --- Model Components (mapping to KF variables) ---
+        self.transition_model = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, padding_mode='replicate')
+        self.measurement_model = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+        self.input_projection = nn.Conv2d(feature_dim, hidden_dim, kernel_size=1)
+
+        # Q: Process noise variance
+        self.q_head = nn.Sequential(nn.Conv2d(hidden_dim, hidden_dim, 1), nn.Softplus())
+        
+        # R: Measurement noise variance
+        # <-- MODIFIED: Input channels are now feature_dim + 2 (for mu and std maps)
+        self.r_head = nn.Sequential(
+            nn.Conv2d(feature_dim, hidden_dim, 1), 
+            nn.Softplus()
+        )
+
+        # Heads to generate gamma and beta from the final, updated state
+        self.gamma_head = nn.Conv2d(hidden_dim, feature_dim, kernel_size=1)
+        self.beta_head = nn.Conv2d(hidden_dim, feature_dim, kernel_size=1)
+
+        print("Initializing KalmanRecurrentStabilizer")
+
+    def forward(self, 
+                x_t: torch.Tensor, 
+                h_prev: Optional[torch.Tensor] = None, 
+                p_prev: Optional[torch.Tensor] = None
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        B, D, H, W = x_t.shape
+
+        if h_prev is None:
+            h_prev = torch.zeros(B, self.hidden_dim, H, W, dtype=x_t.dtype, device=x_t.device)
+        if p_prev is None:
+            p_prev = torch.ones(B, self.hidden_dim, H, W, dtype=x_t.dtype, device=x_t.device)
+
+        # ======================================================
+        # 1. PREDICT Step
+        # ======================================================
+        h_pred = self.transition_model(h_prev)
+        q_t = self.q_head(h_pred)
+        p_pred = p_prev + q_t
+
+        # ======================================================
+        # 2. UPDATE Step
+        # ======================================================
+        
+        # <-- NEW: Explicitly calculate and use current frame's statistics
+        # Calculate global stats for the current frame
+        mu_t = torch.mean(x_t, dim=[2, 3], keepdim=True)  # Shape: [B, D, 1, 1]
+        std_t = torch.std(x_t, dim=[2, 3], keepdim=True)   # Shape: [B, D, 1, 1]
+        
+        # Concatenate features and their stats to predict measurement noise R
+        measurement_input = self.measurement_model(x_t)
+        
+        # Predict measurement noise variance: R
+        r_t = self.r_head(measurement_input) # <-- MODIFIED: Input is now the concatenated tensor
+
+        # Calculate Kalman Gain: K = P_pred / (P_pred + R)
+        kalman_gain = p_pred / (p_pred + r_t + self.epsilon)
+        
+        # Calculate innovation (measurement residual): y = z_t - H * h_pred
+        innovation = self.input_projection(x_t) - h_pred
+        
+        # Update state: h_next = h_pred + K * y
+        h_next = h_pred + kalman_gain * innovation
+        
+        # Update uncertainty: P_next = (I - K) * P_pred
+        p_next = (1.0 - kalman_gain) * p_pred
+
+        # ======================================================
+        # 3. Generate Final Output
+        # ======================================================
+        gamma_map = self.gamma_head(h_next)
+        beta_map = self.beta_head(h_next)
+        gamma_map = F.softplus(gamma_map)
+
+        # Normalize the input x_t using its own global statistics (Instance Norm)
+        x_norm = (x_t - mu_t) / (std_t + self.epsilon) # We can reuse mu_t, std_t
+        
+        # Apply the spatially-varying, Kalman-filtered gamma and beta
+        x_stable = gamma_map * x_norm + beta_map
+        
+        return x_stable, h_next, p_next

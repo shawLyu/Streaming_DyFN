@@ -41,7 +41,7 @@ class Head(nn.Module):
         last_conv_channels: int = 32,
         last_conv_size: int = 1,
         stabilizer_hidden_dim: int = 256,
-        stabilizer_type: Literal['GRU', 'ConvGRU'] = 'ConvGRU',
+        stabilizer_type: Literal['GRU', 'ConvGRU', 'Kalman'] = 'ConvGRU',
     ):
         super().__init__()
         
@@ -62,10 +62,14 @@ class Head(nn.Module):
             ) for dim_out_ in dim_out
         ])
 
+        self.stabilizer_type = stabilizer_type
+
         if stabilizer_type == 'GRU':
             self.stabilizer = RecurrentFeatureStabilizerGRU(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
         elif stabilizer_type == 'ConvGRU':
             self.stabilizer = RecurrentFeatureStabilizer(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
+        elif stabilizer_type == 'Kalman':
+            self.stabilizer = KalmanRecurrentStabilizer(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
         else:
             raise ValueError(f"Invalid stabilizer type: {stabilizer_type}")
     
@@ -90,6 +94,8 @@ class Head(nn.Module):
         hidden_states: torch.Tensor, 
         image: torch.Tensor, 
         prev_state: Optional[torch.Tensor] = None,
+        h_next: Optional[torch.Tensor] = None,
+        p_next: Optional[torch.Tensor] = None,
         batch_size: int = 1,
         inference_mode: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -125,14 +131,20 @@ class Head(nn.Module):
             x = x.reshape(batch_size, -1, *x.shape[1:]).permute(1, 0, 2, 3, 4)
             # --- Apply Recurrent Stabilizer ---
             for i in range(x.shape[0]):
-                stabilized_feature, prev_state = self.stabilizer(x[i], prev_state)
+                if self.stabilizer_type == 'Kalman':
+                    stabilized_feature, h_next, p_next = self.stabilizer(x[i], h_next, p_next)
+                else:
+                    stabilized_feature, prev_state = self.stabilizer(x[i], prev_state)
                 feature_after_stabilizer.append(stabilized_feature[:, None, ...])
             self.stabilizer.ema_mean = None
             self.stabilizer.ema_std = None
             x = torch.cat(feature_after_stabilizer, dim=1)
             x = x.reshape(-1, *x.shape[2:])
         else:
-            x, prev_state = self.stabilizer(x, prev_state)
+            if self.stabilizer_type == 'Kalman':
+                x, h_next, p_next = self.stabilizer(x, h_next, p_next)
+            else:
+                x, prev_state = self.stabilizer(x, prev_state)
         features_after_stabilizer = x.clone()
 
 
@@ -156,9 +168,15 @@ class Head(nn.Module):
             output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
         
         if inference_mode:
-            return output, prev_state, features_before_stabilizer, features_after_stabilizer
+            if self.stabilizer_type == 'Kalman':
+                return output, h_next, p_next, features_before_stabilizer, features_after_stabilizer
+            else:
+                return output, prev_state, features_before_stabilizer, features_after_stabilizer
         else:
-            return output, prev_state
+            if self.stabilizer_type == 'Kalman':
+                return output, prev_state, h_next, p_next
+            else:
+                return output, prev_state
             
             
     def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, memory_banks: List[torch.Tensor] = None):
@@ -363,7 +381,10 @@ class MoGeModel(nn.Module):
         features = self.backbone.get_intermediate_layers(image_14, self.intermediate_layers, return_class_token=True)
 
         # Predict points (and mask)
-        output, _ = self.head.forward_recurrent(features, image, batch_size=B)
+        if self.head.stabilizer_type == 'Kalman':
+            output, _, _, _ = self.head.forward_recurrent(features, image, batch_size=B)
+        else:
+            output, _ = self.head.forward_recurrent(features, image, batch_size=B)
         points, mask = output
 
         # # Predict scale and shift from the class token
@@ -431,13 +452,18 @@ class MoGeModel(nn.Module):
         # feature_before_temporal_attention_list = []
         # Get intermediate layers from the backbone
         prev_state = None
+        h_next = None
+        p_next = None
         feats = [[] for _ in range(self.intermediate_layers)]
         cls_tokens = [[] for _ in range(self.intermediate_layers)]
         features_before_stabilizer_list = []
         features_after_stabilizer_list = []
         for i in tqdm(range(image_14.shape[0]), desc="Processing frames"):
             features = self.backbone.get_intermediate_layers(image_14[i][None, ...], self.intermediate_layers, return_class_token=True)
-            output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state, inference_mode=True)
+            if self.head.stabilizer_type == 'Kalman':
+                output, h_next, p_next, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state=prev_state, h_next=h_next, p_next=p_next, inference_mode=True)
+            else:
+                output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state, inference_mode=True)
             features_before_stabilizer_list.append(features_before_stabilizer)
             features_after_stabilizer_list.append(features_after_stabilizer)
             points, mask = output

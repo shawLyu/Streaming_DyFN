@@ -179,6 +179,7 @@ def main(
 
     if vis_feature:
         print("==> visualizing feature maps")
+        frames_np = (frames * 255).astype(np.uint8)
         for feat_before, feat_after in zip(feature_before_temporal_attention, feature_after_temporal_attention):
             feat_before_svd = compute_svd_raw(feat_before)
             feat_after_svd = compute_svd_raw(feat_after)
