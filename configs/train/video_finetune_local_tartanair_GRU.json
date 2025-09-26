@@ -86,7 +86,7 @@
         "type": "AdamW",
         "params": [
             {"params": {"include": ["*stabilizer.*"], "lr": 1e-3}},
-            {"params": {"include": ["*head.*"], "exclude": ["*stabilizer.*"]}, "lr": 0.0}
+            {"params": {"include": ["*head.*"], "exclude": ["*stabilizer.*"]}, "lr": 1e-5}
         ]
     },
     "lr_scheduler": {

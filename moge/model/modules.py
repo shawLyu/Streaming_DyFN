@@ -635,7 +635,9 @@ class RecurrentFeatureStabilizer(nn.Module):
         # --- 2. Correction Path (Learnable) ---
         # x_pooled = F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1) # [B, D] # <-- DELETED
         
+        first_frame = False
         if prev_state is None:
+            first_frame = True
             prev_state = self.initial_state_projector(x) # <-- MODIFIED (is 4D map)
             # prev_state = torch.zeros(B, self.hidden_dim, H, W, dtype=x.dtype, device=x.device) # <-- MODIFIED (is 4D map)
             
@@ -671,7 +673,10 @@ class RecurrentFeatureStabilizer(nn.Module):
         
         # Apply combined (and now spatially-varying) scale and shift
         # This is now [B,D,H,W] * [B,D,H,W] + [B,D,H,W]
-        x_stable = gamma_final * x_norm + beta_final
+        if not first_frame:
+            x_stable = gamma_final * x_norm + beta_final
+        else:
+            x_stable = x
         
         return x_stable, next_state
 
@@ -708,6 +713,16 @@ class KalmanRecurrentStabilizer(nn.Module):
         self.gamma_head = nn.Conv2d(hidden_dim, feature_dim, kernel_size=1)
         self.beta_head = nn.Conv2d(hidden_dim, feature_dim, kernel_size=1)
 
+        self.initial_h_prev_projector = nn.Sequential(
+                nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1, padding_mode='replicate'),
+                nn.Tanh() 
+            ) # <-- NEW
+
+        self.initial_p_prev_projector = nn.Sequential(
+                nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1, padding_mode='replicate'),
+                nn.Tanh() 
+            ) # <-- NEW
+
         print("Initializing KalmanRecurrentStabilizer")
 
     def forward(self, 
@@ -718,10 +733,15 @@ class KalmanRecurrentStabilizer(nn.Module):
         
         B, D, H, W = x_t.shape
 
+        first_frame = False
         if h_prev is None:
-            h_prev = torch.zeros(B, self.hidden_dim, H, W, dtype=x_t.dtype, device=x_t.device)
+            first_frame = True
+            h_prev = self.initial_h_prev_projector(x_t) # <-- MODIFIED
+            # h_prev = torch.zeros(B, self.hidden_dim, H, W, dtype=x_t.dtype, device=x_t.device)
         if p_prev is None:
-            p_prev = torch.ones(B, self.hidden_dim, H, W, dtype=x_t.dtype, device=x_t.device)
+            first_frame = True
+            p_prev = self.initial_p_prev_projector(x_t) # <-- MODIFIED
+            # p_prev = torch.ones(B, self.hidden_dim, H, W, dtype=x_t.dtype, device=x_t.device)
 
         # ======================================================
         # 1. PREDICT Step
@@ -768,6 +788,9 @@ class KalmanRecurrentStabilizer(nn.Module):
         x_norm = (x_t - mu_t) / (std_t + self.epsilon) # We can reuse mu_t, std_t
         
         # Apply the spatially-varying, Kalman-filtered gamma and beta
-        x_stable = gamma_map * x_norm + beta_map
+        if not first_frame:
+            x_stable = gamma_map * x_norm + beta_map
+        else:
+            x_stable = x_t
         
         return x_stable, h_next, p_next

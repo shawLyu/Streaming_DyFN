@@ -101,6 +101,7 @@ def main(
     if accelerator.is_main_process:
         if enable_mlflow:
             try:
+                mlflow.start_run(run_name=workspace.split('/')[-1])
                 mlflow.log_params({
                     **click.get_current_context().params,
                     'batch_size_total': batch_size_total,
@@ -321,12 +322,21 @@ def main(
                     for b in range(current_batch_size):
                         if label_type[b*sequence_length] == 'invalid':
                             continue
-                        # TODO: now use the scale from the first frame, we may add more options here
-                        sequence_pred_points_b = pred_points[b * sequence_length:b * sequence_length + 1]
-                        sequence_gt_points_b = gt_points[b * sequence_length:b * sequence_length + 1]
-                        sequence_gt_mask_b = gt_mask[b * sequence_length:b * sequence_length + 1]
-                        gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
-                                                    sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
+                        align_method = config['loss'].get('align_method', 'scale_from_first_frame')
+                        if align_method == 'scale_from_first_frame':
+                            # This alignment method is to use the first frame to compute the scale and shift
+                            sequence_pred_points_b = pred_points[b * sequence_length:b * sequence_length + 1]
+                            sequence_gt_points_b = gt_points[b * sequence_length:b * sequence_length + 1]
+                            sequence_gt_mask_b = gt_mask[b * sequence_length:b * sequence_length + 1]
+                            gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
+                                                        sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
+                        else:
+                            # This alignment method is to use the whole sequence to compute the scale and shift
+                            sequence_pred_points_b = pred_points[b * sequence_length:(b + 1) * sequence_length]
+                            sequence_gt_points_b = gt_points[b * sequence_length:(b + 1) * sequence_length]
+                            sequence_gt_mask_b = gt_mask[b * sequence_length:(b + 1) * sequence_length]
+                            gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
+                                                        sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
                         for j in range(sequence_length):
                             i = b * sequence_length + j
                             loss_dict, weight_dict, misc_dict = {}, {}, {}
@@ -537,6 +547,8 @@ def main(
             pbar.set_postfix({'loss': loss.item()}, refresh=False)
             pbar.update(1)
 
+        if accelerator.is_main_process:
+            mlflow.end_run()
 
 if __name__ == '__main__':
     main()
