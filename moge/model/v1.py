@@ -167,16 +167,15 @@ class Head(nn.Module):
         else:
             output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
         
-        if inference_mode:
-            if self.stabilizer_type == 'Kalman':
-                return output, h_next, p_next, features_before_stabilizer, features_after_stabilizer
-            else:
-                return output, prev_state, features_before_stabilizer, features_after_stabilizer
+        if self.stabilizer_type == 'Kalman':
+            return output, h_next, p_next, features_before_stabilizer, features_after_stabilizer
         else:
-            if self.stabilizer_type == 'Kalman':
-                return output, prev_state, h_next, p_next
-            else:
-                return output, prev_state
+            return output, prev_state, features_before_stabilizer, features_after_stabilizer
+        # else:
+        #     if self.stabilizer_type == 'Kalman':
+        #         return output, prev_state, h_next, p_next
+        #     else:
+        #         return output, prev_state
             
             
     def forward(self, hidden_states: torch.Tensor, image: torch.Tensor, memory_banks: List[torch.Tensor] = None):
@@ -382,9 +381,9 @@ class MoGeModel(nn.Module):
 
         # Predict points (and mask)
         if self.head.stabilizer_type == 'Kalman':
-            output, _, _, _ = self.head.forward_recurrent(features, image, batch_size=B)
+            output, _, _, feature_before_stabilizer, feature_after_stabilizer = self.head.forward_recurrent(features, image, batch_size=B)
         else:
-            output, _ = self.head.forward_recurrent(features, image, batch_size=B)
+            output, _, feature_before_stabilizer, feature_after_stabilizer = self.head.forward_recurrent(features, image, batch_size=B)
         points, mask = output
 
         # # Predict scale and shift from the class token
@@ -409,7 +408,7 @@ class MoGeModel(nn.Module):
         # points = points
         
         # return_dict = {'points': points, 'mask': mask, "features": features, "metric_scale": scale}
-        return_dict = {'points': points, 'mask': mask, "features": features}
+        return_dict = {'points': points, 'mask': mask, 'feature_before_stabilizer': feature_before_stabilizer, 'feature_after_stabilizer': feature_after_stabilizer}
         return return_dict
 
 
@@ -619,8 +618,7 @@ class MoGeModel(nn.Module):
             'intrinsics': intrinsics,
             'depth': depth,
             'mask': mask_binary,
-            'mask_prob': torch.sigmoid(mask),
-            "features": output["features"]
+            'mask_prob': torch.sigmoid(mask)
         }
 
         return return_dict

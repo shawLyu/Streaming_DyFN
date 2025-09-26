@@ -39,6 +39,7 @@ from moge.train.losses import (
     mask_bce_loss,
     monitoring, 
     scale_shift_loss,
+    gram_anchoring_loss,
 )
 from moge.train.utils import build_optimizer, build_lr_scheduler
 from moge.utils.geometry_torch import intrinsics_to_fov
@@ -311,6 +312,7 @@ def main(
                     with torch.autocast(device_type=accelerator.device.type, dtype=torch.float16, enabled=enable_mixed_precision):
                         output = model(image, num_tokens=num_tokens)
                     pred_points, pred_mask, pred_metric_scale, pred_shift = output['points'], output['mask'], output.get('metric_scale', None), output.get('shift', None)
+                    feature_before_stabilizer, feature_after_stabilizer = output['feature_before_stabilizer'], output['feature_after_stabilizer']
 
                     # Compute loss (per instance)
                     loss_list, weight_list = [], []
@@ -319,9 +321,10 @@ def main(
                     for b in range(current_batch_size):
                         if label_type[b*sequence_length] == 'invalid':
                             continue
-                        sequence_pred_points_b = pred_points[b * sequence_length:(b + 1) * sequence_length]
-                        sequence_gt_points_b = gt_points[b * sequence_length:(b + 1) * sequence_length]
-                        sequence_gt_mask_b = gt_mask[b * sequence_length:(b + 1) * sequence_length]
+                        # TODO: now use the scale from the first frame, we may add more options here
+                        sequence_pred_points_b = pred_points[b * sequence_length:b * sequence_length + 1]
+                        sequence_gt_points_b = gt_points[b * sequence_length:b * sequence_length + 1]
+                        sequence_gt_mask_b = gt_mask[b * sequence_length:b * sequence_length + 1]
                         gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
                                                     sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
                         for j in range(sequence_length):
@@ -365,6 +368,12 @@ def main(
                                 **{k: v.item() for k, v in loss_dict.items()},
                                 **misc_dict,
                             })
+
+                    # enable_gram_anchoring = config['loss'].get('enable_gram_anchoring', False)
+                    # if enable_gram_anchoring:
+                    #     loss_gram_anchoring, _ = gram_anchoring_loss(feature_before_stabilizer, feature_after_stabilizer)
+                    #     loss_list.append(0.001 * loss_gram_anchoring)
+                    #     records.append({'loss_gram_anchoring': loss_gram_anchoring.item()})
 
                     loss = sum(loss_list) / len(loss_list)
                     

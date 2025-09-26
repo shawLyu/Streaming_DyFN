@@ -557,6 +557,11 @@ class RecurrentFeatureStabilizer(nn.Module):
             feature_dim, 
             kernel_size=1
         ) # <-- MODIFIED (was nn.Linear)
+
+        self.initial_state_projector = nn.Sequential(
+                    nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1, padding_mode='replicate'),
+                    nn.Tanh() 
+                ) # <-- NEW
         
         # Initialize the delta heads to output zero
         self._init_weights()
@@ -631,7 +636,8 @@ class RecurrentFeatureStabilizer(nn.Module):
         # x_pooled = F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1) # [B, D] # <-- DELETED
         
         if prev_state is None:
-            prev_state = torch.zeros(B, self.hidden_dim, H, W, dtype=x.dtype, device=x.device) # <-- MODIFIED (is 4D map)
+            prev_state = self.initial_state_projector(x) # <-- MODIFIED (is 4D map)
+            # prev_state = torch.zeros(B, self.hidden_dim, H, W, dtype=x.dtype, device=x.device) # <-- MODIFIED (is 4D map)
             
         # Update the hidden state *map*
         next_state = self.gru_cell(x, prev_state) # <-- MODIFIED (input is x, not x_pooled)

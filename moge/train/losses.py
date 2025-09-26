@@ -301,3 +301,10 @@ def scale_shift_loss(pred_scale: torch.Tensor, pred_shift: torch.Tensor, gt_scal
     loss = (torch.log(pred_scale) - torch.log(gt_scale)).square() + (pred_shift - gt_shift).square()
     loss = loss.mean()
     return loss, {}
+
+def gram_anchoring_loss(feature_before_stabilizer: torch.Tensor, feature_after_stabilizer: torch.Tensor) -> torch.Tensor:
+    feature_before_stabilizer_flatten = feature_before_stabilizer.flatten(2, 3).detach()
+    feature_after_stabilizer_flatten = feature_after_stabilizer.flatten(2, 3)
+    diff = (feature_before_stabilizer_flatten.permute(0, 2, 1) @ feature_before_stabilizer_flatten - feature_after_stabilizer_flatten.permute(0, 2, 1) @ feature_after_stabilizer_flatten)
+    loss = torch.linalg.matrix_norm(diff, ord='fro') ** 2
+    return loss.mean(), {}

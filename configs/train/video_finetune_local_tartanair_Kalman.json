@@ -85,7 +85,7 @@
     "optimizer": {
         "type": "AdamW",
         "params": [
-            {"params": {"include": ["*stabilizer.*"], "lr": 1e-3}},
+            {"params": {"include": ["*stabilizer.*"], "lr": 1e-4}},
             {"params": {"include": ["*head.*"], "exclude": ["*stabilizer.*"]}, "lr": 0.0}
         ]
     },
@@ -101,6 +101,7 @@
     },
     "low_resolution_training_steps": 10000,
     "loss": {
+        "enable_gram_anchoring": false,
         "invalid": {},
         "synthetic": {
             "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
