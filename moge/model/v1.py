@@ -97,7 +97,8 @@ class Head(nn.Module):
         h_next: Optional[torch.Tensor] = None,
         p_next: Optional[torch.Tensor] = None,
         batch_size: int = 1,
-        inference_mode: bool = False
+        inference_mode: bool = False,
+        image_based: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for a single frame in a sequence, using the
@@ -126,25 +127,26 @@ class Head(nn.Module):
         ], dim=1).sum(dim=1)
 
         features_before_stabilizer = x.clone()
-        if not inference_mode:
-            feature_after_stabilizer = []
-            x = x.reshape(batch_size, -1, *x.shape[1:]).permute(1, 0, 2, 3, 4)
-            # --- Apply Recurrent Stabilizer ---
-            for i in range(x.shape[0]):
-                if self.stabilizer_type == 'Kalman':
-                    stabilized_feature, h_next, p_next = self.stabilizer(x[i], h_next, p_next)
-                else:
-                    stabilized_feature, prev_state = self.stabilizer(x[i], prev_state)
-                feature_after_stabilizer.append(stabilized_feature[:, None, ...])
-            self.stabilizer.ema_mean = None
-            self.stabilizer.ema_std = None
-            x = torch.cat(feature_after_stabilizer, dim=1)
-            x = x.reshape(-1, *x.shape[2:])
-        else:
-            if self.stabilizer_type == 'Kalman':
-                x, h_next, p_next = self.stabilizer(x, h_next, p_next)
+        if not image_based:
+            if not inference_mode:
+                feature_after_stabilizer = []
+                x = x.reshape(batch_size, -1, *x.shape[1:]).permute(1, 0, 2, 3, 4)
+                # --- Apply Recurrent Stabilizer ---
+                for i in range(x.shape[0]):
+                    if self.stabilizer_type == 'Kalman':
+                        stabilized_feature, h_next, p_next = self.stabilizer(x[i], h_next, p_next)
+                    else:
+                        stabilized_feature, prev_state = self.stabilizer(x[i], prev_state)
+                    feature_after_stabilizer.append(stabilized_feature[:, None, ...])
+                self.stabilizer.ema_mean = None
+                self.stabilizer.ema_std = None
+                x = torch.cat(feature_after_stabilizer, dim=1)
+                x = x.reshape(-1, *x.shape[2:])
             else:
-                x, prev_state = self.stabilizer(x, prev_state)
+                if self.stabilizer_type == 'Kalman':
+                    x, h_next, p_next = self.stabilizer(x, h_next, p_next)
+                else:
+                    x, prev_state = self.stabilizer(x, prev_state)
         features_after_stabilizer = x.clone()
 
 
@@ -421,6 +423,7 @@ class MoGeModel(nn.Module):
         apply_mask: bool = True,
         force_projection: bool = True,
         use_fp16: bool = True,
+        image_based: bool = False,
     ) -> Dict[str, torch.Tensor]:
         
         original_height, original_width = image.shape[-2:]

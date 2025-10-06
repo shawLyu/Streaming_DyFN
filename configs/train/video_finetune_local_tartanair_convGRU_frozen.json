@@ -71,7 +71,7 @@
     },
     "model_version": "v1",
     "model": {
-        "encoder": "dinov2_vitl14_reg",
+        "encoder": "dinov2_vitl14",
         "remap_output": "exp",
         "intermediate_layers": 4,
         "dim_upsample": [256, 128, 64],
@@ -101,8 +101,8 @@
     },
     "low_resolution_training_steps": 10000,
     "loss": {
-        "align_method": "scale_from_first_frame",
-        "enable_gram_anchoring": false,
+        "align_method": "scale_all_frames",
+        "enable_gram_anchoring": true,
         "invalid": {},
         "synthetic": {
             "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},

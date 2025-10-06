@@ -80,13 +80,13 @@
         "num_tokens_range": [1200, 2500],
         "last_conv_channels": 32,
         "last_conv_size": 1,
-        "stabilizer_type": "ConvGRU"
+        "stabilizer_type": "GRU"
     },
     "optimizer": {
         "type": "AdamW",
         "params": [
             {"params": {"include": ["*stabilizer.*"], "lr": 1e-3}},
-            {"params": {"include": ["*head.*"], "exclude": ["*stabilizer.*"]}, "lr": 1e-5}
+            {"params": {"include": ["*head.*"], "exclude": ["*stabilizer.*"]}, "lr": 0.0}
         ]
     },
     "lr_scheduler": {
@@ -101,6 +101,8 @@
     },
     "low_resolution_training_steps": 10000,
     "loss": {
+        "align_method": "scale_from_whole_sequence",
+        "enable_gram_anchoring": true,
         "invalid": {},
         "synthetic": {
             "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},

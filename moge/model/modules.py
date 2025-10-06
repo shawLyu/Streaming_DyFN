@@ -558,10 +558,10 @@ class RecurrentFeatureStabilizer(nn.Module):
             kernel_size=1
         ) # <-- MODIFIED (was nn.Linear)
 
-        self.initial_state_projector = nn.Sequential(
-                    nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1, padding_mode='replicate'),
-                    nn.Tanh() 
-                ) # <-- NEW
+        # self.initial_state_projector = nn.Sequential(
+        #             nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1, padding_mode='replicate'),
+        #             nn.Tanh() 
+        #         ) # <-- NEW
         
         # Initialize the delta heads to output zero
         self._init_weights()
@@ -635,11 +635,11 @@ class RecurrentFeatureStabilizer(nn.Module):
         # --- 2. Correction Path (Learnable) ---
         # x_pooled = F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1) # [B, D] # <-- DELETED
         
-        first_frame = False
+        # first_frame = False
         if prev_state is None:
-            first_frame = True
-            prev_state = self.initial_state_projector(x) # <-- MODIFIED (is 4D map)
-            # prev_state = torch.zeros(B, self.hidden_dim, H, W, dtype=x.dtype, device=x.device) # <-- MODIFIED (is 4D map)
+            # first_frame = True
+            # prev_state = self.initial_state_projector(x) # <-- MODIFIED (is 4D map)
+            prev_state = torch.zeros(B, self.hidden_dim, H, W, dtype=x.dtype, device=x.device) # <-- MODIFIED (is 4D map)
             
         # Update the hidden state *map*
         next_state = self.gru_cell(x, prev_state) # <-- MODIFIED (input is x, not x_pooled)
@@ -673,10 +673,10 @@ class RecurrentFeatureStabilizer(nn.Module):
         
         # Apply combined (and now spatially-varying) scale and shift
         # This is now [B,D,H,W] * [B,D,H,W] + [B,D,H,W]
-        if not first_frame:
-            x_stable = gamma_final * x_norm + beta_final
-        else:
-            x_stable = x
+        # if not first_frame:
+        x_stable = gamma_final * x_norm + beta_final
+        # else:
+            # x_stable = x
         
         return x_stable, next_state
 

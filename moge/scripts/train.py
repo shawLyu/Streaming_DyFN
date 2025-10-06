@@ -343,11 +343,14 @@ def main(
                             misc_dict['monitoring'] = monitoring(pred_points[i])
                             for k, v in config['loss'][label_type[i]].items():
                                 weight_dict[k] = v['weight']
+                                if k == 'global':
+                                    weight_dict[k+'_per_frame'] = v['weight']
                                 if v['function'] == 'affine_invariant_global_loss':
                                     # NOTE: Adopt the global scale and shift for the local loss
                                     # TODO: add the option here
-                                    loss_dict[k], misc_dict[k], gt_metric_scale, gt_shift = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=gt_metric_scale_b, gt_shift=gt_shift_b)
-                                    # loss_dict[k], misc_dict[k], _, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=None, gt_shift=None)
+                                    loss_dict[k], misc_dict[k], _, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=gt_metric_scale_b, gt_shift=gt_shift_b)
+                                    loss_dict[k+'_per_frame'], misc_dict[k+'_per_frame'], gt_metric_scale, gt_shift = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=None, gt_shift=None)
+                                    # _, _, gt_metric_scale, gt_shift = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=None, gt_shift=None)
                                 elif v['function'] == 'affine_invariant_local_loss':
                                     loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
                                 elif v['function'] == 'normal_loss':
@@ -379,11 +382,11 @@ def main(
                                 **misc_dict,
                             })
 
-                    # enable_gram_anchoring = config['loss'].get('enable_gram_anchoring', False)
-                    # if enable_gram_anchoring:
-                    #     loss_gram_anchoring, _ = gram_anchoring_loss(feature_before_stabilizer, feature_after_stabilizer)
-                    #     loss_list.append(0.001 * loss_gram_anchoring)
-                    #     records.append({'loss_gram_anchoring': loss_gram_anchoring.item()})
+                    enable_gram_anchoring = config['loss'].get('enable_gram_anchoring', False)
+                    if enable_gram_anchoring:
+                        loss_gram_anchoring, _ = gram_anchoring_loss(feature_before_stabilizer, feature_after_stabilizer)
+                        loss_list.append(loss_gram_anchoring)
+                        records.append({'loss_gram_anchoring': loss_gram_anchoring.item()})
 
                     loss = sum(loss_list) / len(loss_list)
                     

@@ -81,6 +81,7 @@ Defaults to 9. Note that it is irrelevant to the output size, which is always th
 @click.option('--vis_feature', is_flag=True, help='Visualize the feature map.')
 @click.option('--vis_normal', is_flag=True, help='Visualize the normal map.')
 @click.option('--depth_show', is_flag=True, help='Show the depth map.')
+@click.option('--image_based', is_flag=True, help='Use image-based inference.')
 def main(
     video_path: str,
     fov_x_: float,
@@ -101,6 +102,7 @@ def main(
     vis_feature: bool,
     vis_normal: bool,
     depth_show: bool,
+    image_based: bool,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -118,7 +120,7 @@ def main(
         # Use sliding window of size 3 with stride 1
         image_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).to(device)
         output = model.infer_video(image_tensor, fov_x=fov_x_, resolution_level=resolution_level, 
-                                   num_tokens=num_tokens, use_fp16=use_fp16)
+                                   num_tokens=num_tokens, use_fp16=use_fp16, image_based=image_based)
 
         points = output['points'].cpu().numpy()
         depth = output['depth'].cpu().numpy()

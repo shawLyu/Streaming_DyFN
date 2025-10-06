@@ -64,7 +64,7 @@ def read_video_frames(video_path, target_fps, max_res):
 
 @click.command(help='Evaluate video results')
 # @click.option('--eval_dataset_list', type=list[str], default=['sintel', 'scannet', 'KITTI', 'bonn', 'NYUv2'], help='List of datasets to evaluate')
-@click.option('--eval_dataset_list', type=list[str], default=['bonn'], help='List of datasets to evaluate')
+@click.option('--eval_dataset_list', type=list[str], default=['scannet'], help='List of datasets to evaluate')
 @click.option('--video_dir_path', type=click.Path(exists=True), required=True, help='Path to evaluated video file')
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')
 @click.option('--output_dir', type=click.Path(), default='outputs_video', help='Directory to save output results')
@@ -79,6 +79,7 @@ Defaults to 9. Note that it is irrelevant to the output size, which is always th
 @click.option('--num_tokens', type=int, default=None, help='number of tokens used for inference. A integer in the (suggested) range of `[1200, 2500]`. \
 `resolution_level` will be ignored if `num_tokens` is provided. Default: None')
 @click.option('--use_fp16', is_flag=True, help='Use fp16 precision for 2x faster inference.')
+@click.option('--image_based', is_flag=True, help='Use image-based inference.')
 def main(
     eval_dataset_list: List[str],
     video_dir_path: str,
@@ -91,6 +92,7 @@ def main(
     resolution_level: int,
     num_tokens: int,
     use_fp16: bool,
+    image_based: bool,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -143,7 +145,7 @@ def main(
                     # Use sliding window of size 3 with stride 1
                     image_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).to(device)
                     output = model.infer_video(image_tensor, fov_x=None, resolution_level=resolution_level, 
-                                            num_tokens=num_tokens, use_fp16=use_fp16)
+                                            num_tokens=num_tokens, use_fp16=use_fp16, image_based=image_based)
 
                     if gt_depth.shape[-2] != image_tensor.shape[-2] or gt_depth.shape[-1] != image_tensor.shape[-1]:
                         output['depth'] = F.interpolate(output['depth'][:, None, ...], size=(gt_depth.shape[-2], gt_depth.shape[-1]), mode='bilinear', align_corners=False).squeeze(1)
