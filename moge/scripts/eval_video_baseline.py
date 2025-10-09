@@ -37,9 +37,10 @@ eval_metrics = [
     "silog_rmse",
 ]
 
-def read_video_frames(video_path, target_fps, max_res):
+def read_video_frames(video_path, target_fps, max_res, silent=False):
     vid = VideoReader(video_path, ctx=cpu(0))
-    print("==> original video shape: ", (len(vid), *vid.get_batch([0]).shape[1:]))
+    if not silent:
+        print("==> original video shape: ", (len(vid), *vid.get_batch([0]).shape[1:]))
     
     original_height, original_width = vid.get_batch([0]).shape[1:3]
     height = round(original_height / 64) * 64
@@ -56,7 +57,8 @@ def read_video_frames(video_path, target_fps, max_res):
     stride = round(vid.get_avg_fps() / fps)
     stride = max(stride, 1)
     frames_idx = list(range(0, len(vid), stride))
-    print(f"==> downsampled shape: {len(frames_idx), *vid.get_batch([0]).shape[1:]}, with stride: {stride}")
+    if not silent:
+        print(f"==> downsampled shape: {len(frames_idx), *vid.get_batch([0]).shape[1:]}, with stride: {stride}")
     
     frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
     return frames, fps
@@ -64,7 +66,7 @@ def read_video_frames(video_path, target_fps, max_res):
 
 @click.command(help='Evaluate video results')
 # @click.option('--eval_dataset_list', type=list[str], default=['sintel', 'scannet', 'KITTI', 'bonn', 'NYUv2'], help='List of datasets to evaluate')
-@click.option('--eval_dataset_list', type=list[str], default=['scannet'], help='List of datasets to evaluate')
+@click.option('--eval_dataset_list', type=list[str], default=['sintel', 'scannet', 'KITTI', 'bonn'], help='List of datasets to evaluate')
 @click.option('--video_dir_path', type=click.Path(exists=True), required=True, help='Path to evaluated video file')
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')
 @click.option('--output_dir', type=click.Path(), default='outputs_video', help='Directory to save output results')
@@ -80,6 +82,7 @@ Defaults to 9. Note that it is irrelevant to the output size, which is always th
 `resolution_level` will be ignored if `num_tokens` is provided. Default: None')
 @click.option('--use_fp16', is_flag=True, help='Use fp16 precision for 2x faster inference.')
 @click.option('--image_based', is_flag=True, help='Use image-based inference.')
+@click.option('--silent', is_flag=True, help='Do not print any information.')
 def main(
     eval_dataset_list: List[str],
     video_dir_path: str,
@@ -93,6 +96,7 @@ def main(
     num_tokens: int,
     use_fp16: bool,
     image_based: bool,
+    silent: bool,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -129,10 +133,11 @@ def main(
         
         for video_path, gt_depth_path in zip(video_path_list, gt_depth_path_list):
             video_name = Path(video_path).stem
-            print(f"\n==> Processing {video_name} and {Path(gt_depth_path).stem}")
+            if not silent:
+                print(f"\n==> Processing {video_name} and {Path(gt_depth_path).stem}")
             
             try:
-                frames, fps = read_video_frames(video_path, target_fps, max_res)
+                frames, fps = read_video_frames(video_path, target_fps, max_res, silent=silent)
                 height, width = frames.shape[1:3]
 
                 gt_depth = np.load(gt_depth_path)['disparity'] \
@@ -225,9 +230,10 @@ def main(
                     
                     dataset_metrics['video_names'].append(video_name)
                     
-                    print(f"==> Depth metrics for {video_name}:")
-                    for metric_name, metric_value in zip(eval_metrics, sample_metric_depth):
-                        print(f"  {metric_name}: {metric_value:.6f}")
+                    if not silent:
+                        print(f"==> Depth metrics for {video_name}:")
+                        for metric_name, metric_value in zip(eval_metrics, sample_metric_depth):
+                            print(f"  {metric_name}: {metric_value:.6f}")
 
                     # evaluate metric for per frame alignment
                     sample_metric_depth_per_frame = []
@@ -238,9 +244,10 @@ def main(
                         sample_metric_depth_per_frame.append(_metric)
                         dataset_metrics[_metric_name + '_per_frame_aligned'].append(_metric)
                     
-                    print(f"==> Depth metrics for {video_name} aligned by per frame:")
-                    for metric_name, metric_value in zip(eval_metrics, sample_metric_depth_per_frame):
-                        print(f"  {metric_name}_per_frame_aligned: {metric_value:.6f}")
+                    if not silent:
+                        print(f"==> Depth metrics for {video_name} aligned by per frame:")
+                        for metric_name, metric_value in zip(eval_metrics, sample_metric_depth_per_frame):
+                            print(f"  {metric_name}_per_frame_aligned: {metric_value:.6f}")
                     
                     # sample_metric_depth_from_disp = []
                     # metric_funcs_depth = [getattr(metric, _met) for _met in eval_metrics]

@@ -448,6 +448,7 @@ class RecurrentFeatureStabilizerGRU(nn.Module):
         self,
         x: torch.Tensor,
         prev_state: Optional[torch.Tensor] = None,
+        ema_only: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for one time step.
@@ -488,8 +489,12 @@ class RecurrentFeatureStabilizerGRU(nn.Module):
         # --- 3. Combine Paths ---
         # Add the baseline and the correction
         # We must clamp gamma to be positive
-        gamma_final = torch.clamp(std_base + gamma_delta, min=self.epsilon)
-        beta_final = mu_base + beta_delta
+        if not ema_only:
+            gamma_final = torch.clamp(std_base + gamma_delta, min=self.epsilon)
+            beta_final = mu_base + beta_delta
+        else:
+            gamma_final = std_base
+            beta_final = mu_base
 
         # --- 4. Apply Normalization ---
         # Calculate current frame's stats (Instance Norm part)

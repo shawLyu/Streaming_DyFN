@@ -99,6 +99,7 @@ class Head(nn.Module):
         batch_size: int = 1,
         inference_mode: bool = False,
         image_based: bool = False,
+        ema_only: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for a single frame in a sequence, using the
@@ -144,9 +145,9 @@ class Head(nn.Module):
                 x = x.reshape(-1, *x.shape[2:])
             else:
                 if self.stabilizer_type == 'Kalman':
-                    x, h_next, p_next = self.stabilizer(x, h_next, p_next)
+                    x, h_next, p_next = self.stabilizer(x, h_next, p_next, ema_only=ema_only)
                 else:
-                    x, prev_state = self.stabilizer(x, prev_state)
+                    x, prev_state = self.stabilizer(x, prev_state, ema_only=ema_only)
         features_after_stabilizer = x.clone()
 
 
@@ -424,6 +425,7 @@ class MoGeModel(nn.Module):
         force_projection: bool = True,
         use_fp16: bool = True,
         image_based: bool = False,
+        ema_only: bool = False,
     ) -> Dict[str, torch.Tensor]:
         
         original_height, original_width = image.shape[-2:]
@@ -450,8 +452,6 @@ class MoGeModel(nn.Module):
         points_list = []
         masks_list = []
         feature_list = []
-        # feature_after_temporal_attention_list = []
-        # feature_before_temporal_attention_list = []
         # Get intermediate layers from the backbone
         prev_state = None
         h_next = None
@@ -463,9 +463,9 @@ class MoGeModel(nn.Module):
         for i in tqdm(range(image_14.shape[0]), desc="Processing frames"):
             features = self.backbone.get_intermediate_layers(image_14[i][None, ...], self.intermediate_layers, return_class_token=True)
             if self.head.stabilizer_type == 'Kalman':
-                output, h_next, p_next, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state=prev_state, h_next=h_next, p_next=p_next, inference_mode=True)
+                output, h_next, p_next, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state=prev_state, h_next=h_next, p_next=p_next, inference_mode=True, image_based=image_based)
             else:
-                output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state, inference_mode=True)
+                output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state, inference_mode=True, image_based=image_based, ema_only=ema_only)
             features_before_stabilizer_list.append(features_before_stabilizer)
             features_after_stabilizer_list.append(features_after_stabilizer)
             points, mask = output

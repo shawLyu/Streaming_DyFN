@@ -50,7 +50,7 @@ def compute_svd_raw(feature):
 
     _, _, vh = np.linalg.svd(feature_2d, full_matrices=False)
 
-    comps = [vh[i].reshape(h, w) for i in range(3)]  # raw values
+    comps = [vh[0].reshape(h, w), vh[1].reshape(h, w), vh[2].reshape(h, w)]  # raw values
     return np.stack(comps, axis=-1)  # (H, W, 3)
 
 def normalize_svd(svd_img, vmin, vmax):
@@ -82,6 +82,7 @@ Defaults to 9. Note that it is irrelevant to the output size, which is always th
 @click.option('--vis_normal', is_flag=True, help='Visualize the normal map.')
 @click.option('--depth_show', is_flag=True, help='Show the depth map.')
 @click.option('--image_based', is_flag=True, help='Use image-based inference.')
+@click.option('--ema_only', is_flag=True, help='Only use the EMA model for inference.')
 def main(
     video_path: str,
     fov_x_: float,
@@ -103,9 +104,11 @@ def main(
     vis_normal: bool,
     depth_show: bool,
     image_based: bool,
+    ema_only: bool,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    assert not (image_based and ema_only), "Image-based inference and EMA-only inference cannot be used together."
 
     # frames: [n, h, w, 3], np.array
     frames, fps = read_video_frames(video_path, target_fps, max_res)
@@ -120,7 +123,7 @@ def main(
         # Use sliding window of size 3 with stride 1
         image_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).to(device)
         output = model.infer_video(image_tensor, fov_x=fov_x_, resolution_level=resolution_level, 
-                                   num_tokens=num_tokens, use_fp16=use_fp16, image_based=image_based)
+                                   num_tokens=num_tokens, use_fp16=use_fp16, image_based=image_based, ema_only=ema_only)
 
         points = output['points'].cpu().numpy()
         depth = output['depth'].cpu().numpy()
@@ -228,7 +231,16 @@ def main(
             grid_video = np.concatenate([frames_np, depth_preds_color], axis=2)
 
         video_name = Path(video_path).stem
-        output_path = os.path.join(output_dir, f'{video_name}_depth.mp4')
+        if image_based:
+            output_path = os.path.join(output_dir, f'{video_name}_image_based_depth.mp4')
+        elif ema_only:
+            output_path = os.path.join(output_dir, f'{video_name}_ema_only_depth.mp4')
+        else:
+            output_path = os.path.join(output_dir, f'{video_name}_depth.mp4')
+        if vis_normal:
+            output_path = output_path.replace('.mp4', '_w_normal.mp4')
+        elif vis_feature:
+            output_path = output_path.replace('.mp4', '_w_feature.mp4')
         mediapy.write_video(output_path, grid_video, fps=10, crf=18)
 if __name__ == '__main__':
     main()
