@@ -21,6 +21,8 @@ from sklearn.linear_model import RANSACRegressor, LinearRegression
 from moge.model.v1 import MoGeModel
 from moge.utils.io import save_ply
 from moge.utils.vis import colorize_depth_video
+from moge.utils.alignment import align_depth_affine
+from moge.utils.geometry_torch import mask_aware_nearest_resize
 from moge.video_benchmark.eval.metric import *
 import moge.video_benchmark.eval.metric as metric
 
@@ -70,6 +72,7 @@ def read_video_frames(video_path, target_fps, max_res, silent=False):
 @click.option('--video_dir_path', type=click.Path(exists=True), required=True, help='Path to evaluated video file')
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')
 @click.option('--output_dir', type=click.Path(), default='outputs_video', help='Directory to save output results')
+@click.option('--align_method', type=str, default='all', help='Method to align depth. Defaults to "all". Options: "lstsq", "searching", "all".')
 @click.option('--save_video', is_flag=True, help='Save output as video')
 @click.option('--target_fps', type=int, default=15, help='Target frames per second for video processing')
 @click.option('--max_res', type=int, default=1024, help='Maximum resolution dimension')
@@ -88,6 +91,7 @@ def main(
     video_dir_path: str,
     pretrained_model_name_or_path: str,
     output_dir: str,
+    align_method: str,
     save_video: bool,
     target_fps: int,
     max_res: int,
@@ -127,8 +131,13 @@ def main(
             continue
 
         # Initialize metrics storage for this dataset
-        dataset_metrics = {metric_name: [] for metric_name in eval_metrics}
-        dataset_metrics.update({metric_name + '_per_frame_aligned': [] for metric_name in eval_metrics})
+        dataset_metrics = {}
+        if align_method == 'lstsq' or align_method == 'all':
+            dataset_metrics.update({metric_name + '_lstsq': [] for metric_name in eval_metrics})
+            dataset_metrics.update({metric_name + '_per_frame_aligned_lstsq': [] for metric_name in eval_metrics})
+        if align_method == 'searching' or align_method == 'all':
+            dataset_metrics.update({metric_name + '_searching': [] for metric_name in eval_metrics})
+            dataset_metrics.update({metric_name + '_per_frame_aligned_searching': [] for metric_name in eval_metrics})
         dataset_metrics['video_names'] = []
         
         for video_path, gt_depth_path in zip(video_path_list, gt_depth_path_list):
@@ -163,105 +172,168 @@ def main(
                     depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
                     valid_mask = np.logical_and(gt_depth > 1e-3, gt_depth < depth_max[dataset])
 
-                    # Evaluate metric for per frame alignment
-                    scales_per_frame, shifts_per_frame = [], []
-                    per_frame_aligned_pred_depth = []
-                    for pred_depth_i, gt_depth_i in zip(depth, gt_depth):
-                        valid_mask_i = np.logical_and(gt_depth_i > 1e-3, gt_depth_i < depth_max[dataset])
-                        pred_depth_i_masked = pred_depth_i[valid_mask_i].reshape(-1, 1)
-                        gt_depth_i_masked = gt_depth_i[valid_mask_i].reshape(-1, 1)
-                        _ones = np.ones_like(pred_depth_i_masked)
-                        A = np.concatenate([pred_depth_i_masked, _ones], axis=-1)
-                        X = np.linalg.lstsq(A, gt_depth_i_masked, rcond=None)[0]
-                        scale, shift = X # gt = scale * pred + shift
-                        scales_per_frame.append(scale)
-                        shifts_per_frame.append(shift)
-                        aligned_pred_depth_i = scale * pred_depth_i + shift
-                        aligned_pred_depth_i = np.clip(aligned_pred_depth_i, a_min=1e-3, a_max=depth_max[dataset])
-                        per_frame_aligned_pred_depth.append(aligned_pred_depth_i)
+                    if align_method == 'lstsq' or align_method == 'all':
+                        # Evaluate metric for per frame alignment for lstsq
+                        scales_per_frame, shifts_per_frame = [], []
+                        per_frame_aligned_pred_depth = []
+                        for pred_depth_i, gt_depth_i in zip(depth, gt_depth):
+                            valid_mask_i = np.logical_and(gt_depth_i > 1e-3, gt_depth_i < depth_max[dataset])
+                            pred_depth_i_masked = pred_depth_i[valid_mask_i].reshape(-1, 1)
+                            gt_depth_i_masked = gt_depth_i[valid_mask_i].reshape(-1, 1)
+                            _ones = np.ones_like(pred_depth_i_masked)
+                            A = np.concatenate([pred_depth_i_masked, _ones], axis=-1)
+                            X = np.linalg.lstsq(A, gt_depth_i_masked, rcond=None)[0]
+                            scale, shift = X # gt = scale * pred + shift
+                            scales_per_frame.append(scale)
+                            shifts_per_frame.append(shift)
+                            aligned_pred_depth_i = scale * pred_depth_i + shift
+                            aligned_pred_depth_i = np.clip(aligned_pred_depth_i, a_min=1e-3, a_max=depth_max[dataset])
+                            per_frame_aligned_pred_depth.append(aligned_pred_depth_i)
 
-                    per_frame_aligned_pred_depth = np.stack(per_frame_aligned_pred_depth, axis=0)
-                    per_frame_aligned_pred_depth = torch.from_numpy(per_frame_aligned_pred_depth).to(device)
+                        per_frame_aligned_pred_depth = np.stack(per_frame_aligned_pred_depth, axis=0)
+                        per_frame_aligned_pred_depth = torch.from_numpy(per_frame_aligned_pred_depth).to(device)
 
-                    # Depth alignment
-                    gt_depth_masked = gt_depth[valid_mask].reshape((-1, 1)).astype(np.float64)
-                    pred_depth_masked = depth[valid_mask].reshape((-1, 1)).astype(np.float64)
-                    _ones = np.ones_like(pred_depth_masked)
-                    A = np.concatenate([pred_depth_masked, _ones], axis=-1)
-                    X = np.linalg.lstsq(A, gt_depth_masked, rcond=None)[0]
-                    scale_global, shift_global = X # gt = scale * pred + shift
-                    aligned_pred_depth = scale_global * depth + shift_global
-                    aligned_pred_depth = np.clip(aligned_pred_depth, a_min=1e-3, a_max=depth_max[dataset]) 
-                    aligned_pred_depth = torch.from_numpy(aligned_pred_depth).to(device)
+                        # Depth alignment
+                        gt_depth_masked = gt_depth[valid_mask].reshape((-1, 1)).astype(np.float64)
+                        pred_depth_masked = depth[valid_mask].reshape((-1, 1)).astype(np.float64)
+                        _ones = np.ones_like(pred_depth_masked)
+                        A = np.concatenate([pred_depth_masked, _ones], axis=-1)
+                        X = np.linalg.lstsq(A, gt_depth_masked, rcond=None)[0]
+                        scale_global, shift_global = X # gt = scale * pred + shift
+                        aligned_pred_depth = scale_global * depth + shift_global
+                        aligned_pred_depth = np.clip(aligned_pred_depth, a_min=1e-3, a_max=depth_max[dataset]) 
+                        aligned_pred_depth = torch.from_numpy(aligned_pred_depth).to(device)
 
-                    n = valid_mask.sum((-1, -2))
-                    valid_frame = (n > 0)
+                        n = valid_mask.sum((-1, -2))
+                        valid_frame = (n > 0)
 
-                    # Disparity alignment
-                    # gt_disp_masked = 1 / (gt_depth[valid_mask].reshape((-1, 1)).astype(np.float64) + 1e-8)
-                    # pred_disp_masked = 1 / (depth[valid_mask].reshape((-1, 1)).astype(np.float64) + 1e-8)
-                    # disp = 1 / (depth.astype(np.float64) + 1e-8)
-                    # _ones = np.ones_like(pred_disp_masked)
-                    # A = np.concatenate([pred_disp_masked, _ones], axis=-1)
-                    # X = np.linalg.lstsq(A, gt_disp_masked, rcond=None)[0]
-                    # scale, shift = X # gt = scale * pred + shift
-                    # aligned_pred_disp = scale * disp + shift
-                    # aligned_pred_disp = np.clip(aligned_pred_disp, a_min=1e-3, a_max=None) 
-                    # depth_placeholder = np.zeros_like(aligned_pred_disp)
-                    # non_negative_mask = aligned_pred_disp > 0
-                    # depth_placeholder[non_negative_mask] = 1 / aligned_pred_disp[non_negative_mask]
+                        # aligned_pred_depth_from_disp = torch.from_numpy(depth_placeholder).to(device)
+                        gt_depth_torch = torch.from_numpy(gt_depth).to(device)
+                        valid_mask_torch = torch.from_numpy(valid_mask).to(device)
+                        aligned_pred_depth_valid_torch = aligned_pred_depth[valid_frame]
+                        gt_depth_valid_torch = gt_depth_torch[valid_frame]
+                        valid_mask_valid_torch = valid_mask_torch[valid_frame]
+                        per_frame_aligned_pred_depth_valid_torch = per_frame_aligned_pred_depth[valid_frame]
 
-                    # aligned_pred_depth_from_disp = torch.from_numpy(depth_placeholder).to(device)
-                    gt_depth = torch.from_numpy(gt_depth).to(device)
-                    valid_mask = torch.from_numpy(valid_mask).to(device)
-                    aligned_pred_depth = aligned_pred_depth[valid_frame]
-                    gt_depth = gt_depth[valid_frame]
-                    valid_mask = valid_mask[valid_frame]
-                    per_frame_aligned_pred_depth = per_frame_aligned_pred_depth[valid_frame]
+                        # evaluate metric 
+                        sample_metric_depth = []
+                        metric_funcs_depth = [getattr(metric, _met) for _met in eval_metrics]
+                        for met_func in metric_funcs_depth:
+                            _metric_name = met_func.__name__
+                            _metric = met_func(aligned_pred_depth_valid_torch, gt_depth_valid_torch, valid_mask_valid_torch).item()
+                            sample_metric_depth.append(_metric)
+                            dataset_metrics[_metric_name + '_lstsq'].append(_metric)
+                        
+                        dataset_metrics['video_names'].append(video_name)
+                        
+                        if not silent:
+                            print(f"==> Depth metrics for {video_name}:")
+                            for metric_name, metric_value in zip(eval_metrics, sample_metric_depth):
+                                print(f"  {metric_name}_lstsq: {metric_value:.6f}")
 
-                    # evaluate metric 
-                    sample_metric_depth = []
-                    metric_funcs_depth = [getattr(metric, _met) for _met in eval_metrics]
-                    for met_func in metric_funcs_depth:
-                        _metric_name = met_func.__name__
-                        _metric = met_func(aligned_pred_depth, gt_depth, valid_mask).item()
-                        sample_metric_depth.append(_metric)
-                        dataset_metrics[_metric_name].append(_metric)
+                        # evaluate metric for per frame alignment
+                        sample_metric_depth_per_frame = []
+                        metric_funcs_depth_per_frame = [getattr(metric, _met) for _met in eval_metrics]
+                        for met_func in metric_funcs_depth_per_frame:
+                            _metric_name = met_func.__name__
+                            _metric = met_func(per_frame_aligned_pred_depth_valid_torch, gt_depth_valid_torch, valid_mask_valid_torch).item()
+                            sample_metric_depth_per_frame.append(_metric)
+                            dataset_metrics[_metric_name + '_per_frame_aligned_lstsq'].append(_metric)
+                        
+                        if not silent:
+                            print(f"==> Depth metrics for {video_name} aligned by per frame:")
+                            for metric_name, metric_value in zip(eval_metrics, sample_metric_depth_per_frame):
+                                print(f"  {metric_name}_per_frame_aligned_lstsq: {metric_value:.6f}")
+
+                    if align_method == 'searching' or align_method == 'all':
+                        # Per frame aligned using mask_aware_nearest_resize
+                        per_frame_aligned_pred_depth_searching = []
+                        for pred_depth_i, gt_depth_i in zip(depth, gt_depth):
+                            valid_mask_i = np.logical_and(gt_depth_i > 1e-3, gt_depth_i < depth_max[dataset])
+                            
+                            depth_mask = torch.from_numpy(valid_mask_i).squeeze().to(device)
+                            
+                            _, lr_mask, lr_index = mask_aware_nearest_resize(None, depth_mask, (64, 64), return_index=True)
+                            
+                            gt_depth_torch = torch.from_numpy(gt_depth_i).squeeze().to(device)
+                            pred_depth_torch = torch.from_numpy(pred_depth_i).squeeze().to(device)
+                            
+                            pred_depth_lr_masked, gt_depth_lr_masked = pred_depth_torch[lr_index][lr_mask], gt_depth_torch[lr_index][lr_mask]
+                            scale_searching, shift_searching = align_depth_affine(pred_depth_lr_masked, gt_depth_lr_masked, 1 / gt_depth_lr_masked)
+                            
+                            # Apply alignment to full depth map
+                            aligned_pred_depth_i = scale_searching.item() * pred_depth_i + shift_searching.item()
+                            aligned_pred_depth_i = np.clip(aligned_pred_depth_i, a_min=1e-3, a_max=depth_max[dataset])
+                            per_frame_aligned_pred_depth_searching.append(aligned_pred_depth_i)
+                        
+
+                        per_frame_aligned_pred_depth_searching = np.stack(per_frame_aligned_pred_depth_searching, axis=0)
+                        per_frame_aligned_pred_depth_searching = torch.from_numpy(per_frame_aligned_pred_depth_searching).to(device)
+
+                        # Global aligned using mask_aware_nearest_resize
+                        pred_depth_lr_list = []
+                        gt_depth_lr_list = []
+                        for pred_depth_i, gt_depth_i in zip(depth, gt_depth):
+                            valid_mask_i = np.logical_and(gt_depth_i > 1e-3, gt_depth_i < depth_max[dataset])
+                            
+                            depth_mask = torch.from_numpy(valid_mask_i).squeeze().to(device)
+                            
+                            _, lr_mask, lr_index = mask_aware_nearest_resize(None, depth_mask, (64, 64), return_index=True)
+                            
+                            gt_depth_torch = torch.from_numpy(gt_depth_i).squeeze().to(device)
+                            pred_depth_torch = torch.from_numpy(pred_depth_i).squeeze().to(device)
+                            
+                            pred_depth_lr_masked, gt_depth_lr_masked = pred_depth_torch[lr_index][lr_mask], gt_depth_torch[lr_index][lr_mask]
+                            pred_depth_lr_list.append(pred_depth_lr_masked)
+                            gt_depth_lr_list.append(gt_depth_lr_masked)
+
+                        pred_depth_lr_all = torch.cat(pred_depth_lr_list, dim=0)
+                        gt_depth_lr_all = torch.cat(gt_depth_lr_list, dim=0)
+
+                        scale_all, shift_all = align_depth_affine(pred_depth_lr_all[::gt_depth.shape[0]], gt_depth_lr_all[::gt_depth.shape[0]], 1 / gt_depth_lr_all[::gt_depth.shape[0]])
+                        
+                        # Apply global alignment to full depth maps
+                        aligned_pred_depth_searching = scale_all.item() * depth + shift_all.item()
+                        aligned_pred_depth_searching = np.clip(aligned_pred_depth_searching, a_min=1e-3, a_max=depth_max[dataset]) 
+                        aligned_pred_depth_searching = torch.from_numpy(aligned_pred_depth_searching).to(device)
+
+                        n = valid_mask.sum((-1, -2))
+                        valid_frame = (n > 0)
+
+                        aligned_pred_depth_valid_torch = aligned_pred_depth_searching[valid_frame]
+                        per_frame_aligned_pred_depth_valid_torch = per_frame_aligned_pred_depth_searching[valid_frame]
+
+                        # evaluate metric for global searching alignment
+                        sample_metric_depth_searching = []
+                        metric_funcs_depth_searching = [getattr(metric, _met) for _met in eval_metrics]
+                        for met_func in metric_funcs_depth_searching:
+                            _metric_name = met_func.__name__
+                            _metric = met_func(aligned_pred_depth_valid_torch, gt_depth_valid_torch, valid_mask_valid_torch).item()
+                            sample_metric_depth_searching.append(_metric)
+                            dataset_metrics[_metric_name + '_searching'].append(_metric)
+                        
+                        dataset_metrics['video_names'].append(video_name)
+                        
+                        if not silent:
+                            print(f"==> Depth metrics for {video_name} (searching):")
+                            for metric_name, metric_value in zip(eval_metrics, sample_metric_depth_searching):
+                                print(f"  {metric_name}_searching: {metric_value:.6f}")
+
+                        # evaluate metric for per frame searching alignment
+                        sample_metric_depth_per_frame_searching = []
+                        metric_funcs_depth_per_frame_searching = [getattr(metric, _met) for _met in eval_metrics]
+                        for met_func in metric_funcs_depth_per_frame_searching:
+                            _metric_name = met_func.__name__
+                            _metric = met_func(per_frame_aligned_pred_depth_valid_torch, gt_depth_valid_torch, valid_mask_valid_torch).item()
+                            sample_metric_depth_per_frame_searching.append(_metric)
+                            dataset_metrics[_metric_name + '_per_frame_aligned_searching'].append(_metric)
+                        
+                        if not silent:
+                            print(f"==> Depth metrics for {video_name} aligned by per frame (searching):")
+                            for metric_name, metric_value in zip(eval_metrics, sample_metric_depth_per_frame_searching):
+                                print(f"  {metric_name}_per_frame_aligned_searching: {metric_value:.6f}")
                     
-                    dataset_metrics['video_names'].append(video_name)
                     
-                    if not silent:
-                        print(f"==> Depth metrics for {video_name}:")
-                        for metric_name, metric_value in zip(eval_metrics, sample_metric_depth):
-                            print(f"  {metric_name}: {metric_value:.6f}")
-
-                    # evaluate metric for per frame alignment
-                    sample_metric_depth_per_frame = []
-                    metric_funcs_depth_per_frame = [getattr(metric, _met) for _met in eval_metrics]
-                    for met_func in metric_funcs_depth_per_frame:
-                        _metric_name = met_func.__name__
-                        _metric = met_func(per_frame_aligned_pred_depth, gt_depth, valid_mask).item()
-                        sample_metric_depth_per_frame.append(_metric)
-                        dataset_metrics[_metric_name + '_per_frame_aligned'].append(_metric)
-                    
-                    if not silent:
-                        print(f"==> Depth metrics for {video_name} aligned by per frame:")
-                        for metric_name, metric_value in zip(eval_metrics, sample_metric_depth_per_frame):
-                            print(f"  {metric_name}_per_frame_aligned: {metric_value:.6f}")
-                    
-                    # sample_metric_depth_from_disp = []
-                    # metric_funcs_depth = [getattr(metric, _met) for _met in eval_metrics]
-                    # for met_func in metric_funcs_depth:
-                    #     _metric_name = met_func.__name__
-                    #     _metric = met_func(aligned_pred_depth_from_disp, gt_depth, valid_mask).item()
-                    #     sample_metric_depth_from_disp.append(_metric)
-                    #     dataset_metrics[_metric_name + '_from_disp'].append(_metric)
-                    
-                    # dataset_metrics['video_names'].append(video_name)
-                    
-                    # print(f"==> Depth metrics for {video_name} aligned by disparity:")
-                    # for metric_name, metric_value in zip(eval_metrics, sample_metric_depth_from_disp):
-                    #     print(f"  {metric_name}_from_disp: {metric_value:.6f}")
 
                     if save_video:
                         Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -290,24 +362,41 @@ def main(
             
             dataset_summary = {}
             for metric_name in eval_metrics:
-                if dataset_metrics[metric_name]:
-                    avg_metric = np.mean(dataset_metrics[metric_name])
-                    std_metric = np.std(dataset_metrics[metric_name])
-                    dataset_summary[metric_name] = {
-                        'mean': float(avg_metric),
-                        'std': float(std_metric)
-                        # 'values': [float(x) for x in dataset_metrics[metric_name]]
-                    }
-                    avg_metric_per_frame_aligned = np.mean(dataset_metrics[metric_name + '_per_frame_aligned'])
-                    std_metric_per_frame_aligned = np.std(dataset_metrics[metric_name + '_per_frame_aligned'])
-                    dataset_summary[metric_name + '_per_frame_aligned'] = {
-                        'mean': float(avg_metric_per_frame_aligned),
-                        'std': float(std_metric_per_frame_aligned)
-                    }
-                    print(f"{metric_name}: {avg_metric:.6f} ± {std_metric:.6f}")
-                    print(f"{metric_name}_per_frame_aligned: {avg_metric_per_frame_aligned:.6f} ± {std_metric_per_frame_aligned:.6f}")
-                else:
-                    dataset_summary[metric_name] = {'mean': None, 'std': None, 'values': []}
+                # Add lstsq metrics
+                if align_method == 'lstsq' or align_method == 'all':
+                    if dataset_metrics[metric_name + '_lstsq']:
+                        avg_metric_lstsq = np.mean(dataset_metrics[metric_name + '_lstsq'])
+                        std_metric_lstsq = np.std(dataset_metrics[metric_name + '_lstsq'])
+                        dataset_summary[metric_name + '_lstsq'] = {
+                            'mean': float(avg_metric_lstsq),
+                            'std': float(std_metric_lstsq)
+                        }
+                        avg_metric_per_frame_lstsq = np.mean(dataset_metrics[metric_name + '_per_frame_aligned_lstsq'])
+                        std_metric_per_frame_lstsq = np.std(dataset_metrics[metric_name + '_per_frame_aligned_lstsq'])
+                        dataset_summary[metric_name + '_per_frame_aligned_lstsq'] = {
+                            'mean': float(avg_metric_per_frame_lstsq),
+                            'std': float(std_metric_per_frame_lstsq)
+                        }
+                        print(f"{metric_name}_lstsq: {avg_metric_lstsq:.6f} ± {std_metric_lstsq:.6f}")
+                        print(f"{metric_name}_per_frame_aligned_lstsq: {avg_metric_per_frame_lstsq:.6f} ± {std_metric_per_frame_lstsq:.6f}")
+                
+                # Add searching metrics
+                if align_method == 'searching' or align_method == 'all':
+                    if dataset_metrics[metric_name + '_searching']:
+                        avg_metric_searching = np.mean(dataset_metrics[metric_name + '_searching'])
+                        std_metric_searching = np.std(dataset_metrics[metric_name + '_searching'])
+                        dataset_summary[metric_name + '_searching'] = {
+                            'mean': float(avg_metric_searching),
+                            'std': float(std_metric_searching)
+                        }
+                        avg_metric_per_frame_searching = np.mean(dataset_metrics[metric_name + '_per_frame_aligned_searching'])
+                        std_metric_per_frame_searching = np.std(dataset_metrics[metric_name + '_per_frame_aligned_searching'])
+                        dataset_summary[metric_name + '_per_frame_aligned_searching'] = {
+                            'mean': float(avg_metric_per_frame_searching),
+                            'std': float(std_metric_per_frame_searching)
+                        }
+                        print(f"{metric_name}_searching: {avg_metric_searching:.6f} ± {std_metric_searching:.6f}")
+                        print(f"{metric_name}_per_frame_aligned_searching: {avg_metric_per_frame_searching:.6f} ± {std_metric_per_frame_searching:.6f}")
             
             dataset_summary['video_names'] = dataset_metrics['video_names']
             dataset_summary['num_videos'] = len(dataset_metrics['video_names'])
@@ -317,17 +406,34 @@ def main(
             per_scene_results = []
             for idx, video_name in enumerate(dataset_metrics['video_names']):
                 scene_result = {'video_name': video_name}
-                for metric_name in eval_metrics:
-                    if len(dataset_metrics[metric_name]) > idx:
-                        scene_result[metric_name] = float(dataset_metrics[metric_name][idx])
-                    else:
-                        scene_result[metric_name] = None
+                
+                # Add lstsq metrics
+                if align_method == 'lstsq' or align_method == 'all':
+                    for metric_name in eval_metrics:
+                        if len(dataset_metrics[metric_name + '_lstsq']) > idx:
+                            scene_result[metric_name + '_lstsq'] = float(dataset_metrics[metric_name + '_lstsq'][idx])
+                        else:
+                            scene_result[metric_name + '_lstsq'] = None
+                    for metric_name in eval_metrics:
+                        if len(dataset_metrics[metric_name + '_per_frame_aligned_lstsq']) > idx:
+                            scene_result[metric_name + '_per_frame_aligned_lstsq'] = float(dataset_metrics[metric_name + '_per_frame_aligned_lstsq'][idx])
+                        else:
+                            scene_result[metric_name + '_per_frame_aligned_lstsq'] = None
+                
+                # Add searching metrics
+                if align_method == 'searching' or align_method == 'all':
+                    for metric_name in eval_metrics:
+                        if len(dataset_metrics[metric_name + '_searching']) > idx:
+                            scene_result[metric_name + '_searching'] = float(dataset_metrics[metric_name + '_searching'][idx])
+                        else:
+                            scene_result[metric_name + '_searching'] = None
+                    for metric_name in eval_metrics:
+                        if len(dataset_metrics[metric_name + '_per_frame_aligned_searching']) > idx:
+                            scene_result[metric_name + '_per_frame_aligned_searching'] = float(dataset_metrics[metric_name + '_per_frame_aligned_searching'][idx])
+                        else:
+                            scene_result[metric_name + '_per_frame_aligned_searching'] = None
+                
                 per_scene_results.append(scene_result)
-                for metric_name in eval_metrics:
-                    if len(dataset_metrics[metric_name + '_per_frame_aligned']) > idx:
-                        scene_result[metric_name + '_per_frame_aligned'] = float(dataset_metrics[metric_name + '_per_frame_aligned'][idx])
-                    else:
-                        scene_result[metric_name + '_per_frame_aligned'] = None
             # Save per-scene results to a JSON file
             per_scene_file = os.path.join(output_dir, f"{dataset}_per_scene_results.json")
             with open(per_scene_file, 'w') as f:
@@ -353,8 +459,12 @@ def main(
         print(f"\nDataset: {dataset}")
         print(f"Number of videos: {results['num_videos']}")
         for metric_name in eval_metrics:
-            if results[metric_name]['mean'] is not None:
-                print(f"  {metric_name}: {results[metric_name]['mean']:.6f} ± {results[metric_name]['std']:.6f}")
+            if align_method == 'lstsq' or align_method == 'all':
+                if results[metric_name + '_lstsq']['mean'] is not None:
+                    print(f"  {metric_name}_lstsq: {results[metric_name + '_lstsq']['mean']:.6f} ± {results[metric_name + '_lstsq']['std']:.6f}")
+            if align_method == 'searching' or align_method == 'all':
+                if results[metric_name + '_searching']['mean'] is not None:
+                    print(f"  {metric_name}_searching: {results[metric_name + '_searching']['mean']:.6f} ± {results[metric_name + '_searching']['std']:.6f}")
     
     print(f"\nResults saved to: {results_file}")
 
