@@ -2,7 +2,7 @@ import os
 import sys
 from pathlib import Path
 from typing import *
-if (_package_root := str(Path(__file__).absolute().parents[2])) not in sys.path:
+if (_package_root := str(Path(__file__).absolute().parents[1])) not in sys.path:
     sys.path.insert(0, _package_root)
 
 import cv2
@@ -10,17 +10,14 @@ import glob
 import json
 import click
 import torch
-import utils3d
 import mediapy
 import numpy as np
 from tqdm import tqdm
 from decord import VideoReader, cpu
 import torch.nn.functional as F
-from sklearn.linear_model import RANSACRegressor, LinearRegression
 
-from moge.model.v1 import MoGeModel
-from moge.utils.io import save_ply
-from moge.utils.vis import colorize_depth_video
+from flashdepth.model import FlashDepth
+from omegaconf import DictConfig, OmegaConf
 from moge.utils.alignment import align_depth_affine
 from moge.utils.geometry_torch import mask_aware_nearest_resize
 from moge.video_benchmark.eval.metric import *
@@ -39,21 +36,21 @@ eval_metrics = [
     "silog_rmse",
 ]
 
-def read_video_frames(video_path, target_fps, max_res, silent=False):
+def read_video_frames(video_path, target_fps, max_res, patch_size=14, silent=False):
     vid = VideoReader(video_path, ctx=cpu(0))
     if not silent:
         print("==> original video shape: ", (len(vid), *vid.get_batch([0]).shape[1:]))
     
     original_height, original_width = vid.get_batch([0]).shape[1:3]
-    height = round(original_height / 64) * 64
-    width = round(original_width / 64) * 64
+    height = round(original_height / patch_size) * patch_size
+    width = round(original_width / patch_size) * patch_size
     
     if max(height, width) > max_res:
         scale = max_res / max(original_height, original_width)
-        height = round(original_height * scale / 64) * 64
-        width = round(original_width * scale / 64) * 64
+        height = round(original_height * scale / patch_size) * patch_size
+        width = round(original_width * scale / patch_size) * patch_size
 
-    vid = VideoReader(video_path, ctx=cpu(0), width=original_width, height=original_height)
+    vid = VideoReader(video_path, ctx=cpu(0), width=width, height=height)
 
     fps = vid.get_avg_fps() if target_fps == -1 else target_fps
     stride = round(vid.get_avg_fps() / fps)
@@ -63,6 +60,7 @@ def read_video_frames(video_path, target_fps, max_res, silent=False):
         print(f"==> downsampled shape: {len(frames_idx), *vid.get_batch([0]).shape[1:]}, with stride: {stride}")
     
     frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
+
     return frames, fps
 
 
@@ -105,8 +103,49 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
+    # Hardcoded configs
+    hybrid_configs = {'use_hybrid': False, 'teacher_model_path': None, 'teacher_resolution': 490, 'layers_to_skip': [1, 2, 3], 'num_blocks': 4, 'mlp_expand': 2, 'num_heads': 2}
+    model_configs = {
+        'vit_size': 'vitl',
+        'patch_size': 14,
+        'attn_class': 'MemEffAttention',
+        'use_mamba': True, 
+        'mamba_type': 'add', 
+        'num_mamba_layers': 4, 
+        'downsample_mamba': [0.1], 
+        'mamba_pos_embed': None, 
+        'mamba_in_dpt_layer': [3], 
+        'mamba_d_conv': 4, 
+        'mamba_d_state': 256, 
+        'use_hydra': False, 
+        'use_transformer_rnn': False, 
+        'use_xlstm': False,
+    }
+
+    eval_args = {
+        'save_depth_npy': False,
+        'save_vis_map': False,
+        'out_video': False,
+        'out_mp4': False,
+        'use_mamba': True,
+        'resolution': 518,
+        'print_time': True,
+        'loss_type': 'l1',
+        'use_all_frames': True,
+        'use_metrics': False,
+        'dummy_timing': False
+    }
+
+    model = FlashDepth(**dict( 
+        batch_size=1, 
+        hybrid_configs=DictConfig(hybrid_configs),
+        training=False,
+        **DictConfig(model_configs),
+    )).to(device)
+    model.load_state_dict(torch.load(pretrained_model_name_or_path, weights_only=True)["model"])
+    model.eval()
     depth_max = {"sintel": 70, "scannet": 10, "KITTI": 80, "bonn": 10, "NYUv2": 10}
+
     
     # Initialize results storage
     all_results = {}
@@ -161,21 +200,23 @@ def main(
 
                 with torch.no_grad():
                     # Use sliding window of size 3 with stride 1
-                    dataset_metrics['video_names'].append(video_name)
                     image_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).to(device)
-                    output = model.infer_video(image_tensor, fov_x=None, resolution_level=resolution_level, 
-                                            num_tokens=num_tokens, use_fp16=use_fp16, image_based=image_based)
+                    if image_tensor.shape[-2] // 14 != image_tensor.shape[-1] // 14:
+                        image_tensor = F.interpolate(image_tensor, (image_tensor.shape[-2] // 14 * 14, image_tensor.shape[-1] // 14 * 14), mode='bilinear', align_corners=False)
+                    output = model(image_tensor.unsqueeze(0), **eval_args)
 
                     if gt_depth.shape[-2] != image_tensor.shape[-2] or gt_depth.shape[-1] != image_tensor.shape[-1]:
-                        output['depth'] = F.interpolate(output['depth'][:, None, ...], size=(gt_depth.shape[-2], gt_depth.shape[-1]), mode='bilinear', align_corners=False).squeeze(1)
+                        output['depth'] = F.interpolate(output['depth'], size=(gt_depth.shape[-2], gt_depth.shape[-1]), mode='bilinear', align_corners=False).squeeze()
 
-                    points = output['points'].cpu().numpy()
                     depth = output['depth'].cpu().numpy()
-                    mask = output['mask'].cpu().numpy()
                     # Prepare the depth visualization
                     depth = depth[:, None, :, :]
                     depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+                    depth_percentile = np.percentile(depth[depth < 1e6], 95)
+                    depth[depth >= depth_percentile] = depth_percentile
                     valid_mask = np.logical_and(gt_depth > 1e-3, gt_depth < depth_max[dataset])
+
+                    dataset_metrics['video_names'].append(video_name)
 
                     if align_method == 'lstsq' or align_method == 'all':
                         # Evaluate metric for per frame alignment for lstsq
@@ -254,6 +295,7 @@ def main(
                         per_frame_aligned_pred_depth_searching = []
                         for pred_depth_i, gt_depth_i in zip(depth, gt_depth):
                             valid_mask_i = np.logical_and(gt_depth_i > 1e-3, gt_depth_i < depth_max[dataset])
+                            valid_mask_i = np.logical_and(valid_mask_i, pred_depth_i < 1e6)
                             
                             depth_mask = torch.from_numpy(valid_mask_i).squeeze().to(device)
                             
@@ -281,6 +323,7 @@ def main(
                         gt_depth_lr_list = []
                         for pred_depth_i, gt_depth_i in zip(depth, gt_depth):
                             valid_mask_i = np.logical_and(gt_depth_i > 1e-3, gt_depth_i < depth_max[dataset])
+                            valid_mask_i = np.logical_and(valid_mask_i, pred_depth_i < 1e6)
                             
                             depth_mask = torch.from_numpy(valid_mask_i).squeeze().to(device)
                             
