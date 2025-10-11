@@ -144,6 +144,10 @@ def main(
             video_name = Path(video_path).stem
             if not silent:
                 print(f"\n==> Processing {video_name} and {Path(gt_depth_path).stem}")
+            if video_name == "mountain_1_rgb_left":
+                depth_max["sintel"] = 1000
+            else:
+                depth_max["sintel"] = 70
             
             try:
                 frames, fps = read_video_frames(video_path, target_fps, max_res, silent=silent)
@@ -259,14 +263,16 @@ def main(
                             pred_depth_torch = torch.from_numpy(pred_depth_i).squeeze().to(device)
                             
                             pred_depth_lr_masked, gt_depth_lr_masked = pred_depth_torch[lr_index][lr_mask], gt_depth_torch[lr_index][lr_mask]
-                            scale_searching, shift_searching = align_depth_affine(pred_depth_lr_masked, gt_depth_lr_masked, 1 / gt_depth_lr_masked)
+                            try:
+                                scale_searching, shift_searching = align_depth_affine(pred_depth_lr_masked, gt_depth_lr_masked, 1 / gt_depth_lr_masked)
+                            except Exception as e:
+                                import ipdb; ipdb.set_trace()
                             
                             # Apply alignment to full depth map
                             aligned_pred_depth_i = scale_searching.item() * pred_depth_i + shift_searching.item()
                             aligned_pred_depth_i = np.clip(aligned_pred_depth_i, a_min=1e-3, a_max=depth_max[dataset])
                             per_frame_aligned_pred_depth_searching.append(aligned_pred_depth_i)
                         
-
                         per_frame_aligned_pred_depth_searching = np.stack(per_frame_aligned_pred_depth_searching, axis=0)
                         per_frame_aligned_pred_depth_searching = torch.from_numpy(per_frame_aligned_pred_depth_searching).to(device)
 
@@ -286,7 +292,6 @@ def main(
                             pred_depth_lr_masked, gt_depth_lr_masked = pred_depth_torch[lr_index][lr_mask], gt_depth_torch[lr_index][lr_mask]
                             pred_depth_lr_list.append(pred_depth_lr_masked)
                             gt_depth_lr_list.append(gt_depth_lr_masked)
-
                         pred_depth_lr_all = torch.cat(pred_depth_lr_list, dim=0)
                         gt_depth_lr_all = torch.cat(gt_depth_lr_list, dim=0)
 
@@ -300,7 +305,11 @@ def main(
                         n = valid_mask.sum((-1, -2))
                         valid_frame = (n > 0)
 
+                        gt_depth_torch = torch.from_numpy(gt_depth).to(device)
+                        valid_mask_torch = torch.from_numpy(valid_mask).to(device)
                         aligned_pred_depth_valid_torch = aligned_pred_depth_searching[valid_frame]
+                        gt_depth_valid_torch = gt_depth_torch[valid_frame]
+                        valid_mask_valid_torch = valid_mask_torch[valid_frame]
                         per_frame_aligned_pred_depth_valid_torch = per_frame_aligned_pred_depth_searching[valid_frame]
 
                         # evaluate metric for global searching alignment
