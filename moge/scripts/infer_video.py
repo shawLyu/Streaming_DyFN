@@ -48,8 +48,11 @@ def compute_svd_raw(feature):
     c, h, w = feature.shape
     feature_2d = feature.reshape(c, -1)
 
-    _, _, vh = np.linalg.svd(feature_2d, full_matrices=False)
-
+    uh, _, vh = np.linalg.svd(feature_2d, full_matrices=False)
+    if uh[0, 0] < 0:
+        vh[0] = -vh[0]
+    if uh[0, 1] < 0:
+        vh[1] = -vh[1]
     comps = [vh[0].reshape(h, w), vh[1].reshape(h, w), vh[2].reshape(h, w)]  # raw values
     return np.stack(comps, axis=-1)  # (H, W, 3)
 
