@@ -312,3 +312,34 @@ def gram_anchoring_loss(feature_before_stabilizer: torch.Tensor, feature_after_s
     after_gram = after_gram / torch.linalg.matrix_norm(after_gram, ord='fro')[..., None, None]
     diff = (before_gram - after_gram).abs().mean()
     return diff, {}
+
+def temporal_loss(pred_points: torch.Tensor, gt_points: torch.Tensor, mask: torch.Tensor, current_batch_size: int, scale_list: List[torch.Tensor], shift_list: List[torch.Tensor]) -> torch.Tensor:
+    
+    pred_points = pred_points.reshape(current_batch_size, -1, *pred_points.shape[1:]) # [B, S, H, W, 3]
+    gt_points = gt_points.reshape(current_batch_size, -1, *gt_points.shape[1:]) # [B, S, H, W, 3]
+    mask = mask.reshape(current_batch_size, -1, *mask.shape[1:]) # [B, S, H, W]
+    scaled_pred_points = []
+    for i in range(current_batch_size):
+        scaled_pred_points.append(pred_points[i] * scale_list[i][..., None, None] + shift_list[i][..., None, :])
+    scaled_pred_points = torch.stack(scaled_pred_points, dim=0)
+
+    temporal_loss = 0
+    for k in [1, 2, 4]:
+        pred_diff_k = scaled_pred_points[..., :-k, :, :, :] - scaled_pred_points[..., k:, :, :, :]
+        gt_diff_k = gt_points[..., :-k, :, :, :] - gt_points[..., k:, :, :, :]
+
+        valid_diff_k = (mask[..., :-k, :, :] & mask[..., k:, :, :])
+
+        mean_points_k = (gt_points[:, k:] + gt_points[:, :-k]) / 2
+
+        relative_change_k = gt_diff_k.abs() / (mean_points_k.abs() + 1e-6)
+
+        small_change_mask_k = relative_change_k.mean(dim=-1) < 0.2
+
+        temporal_mask_k = valid_diff_k & small_change_mask_k
+
+        if temporal_mask_k.sum() > 0:
+            loss_k = F.l1_loss(pred_diff_k.sum(dim=-1)[temporal_mask_k], gt_diff_k.sum(dim=-1)[temporal_mask_k])
+            temporal_loss += loss_k
+
+    return temporal_loss, {}

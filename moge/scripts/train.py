@@ -40,6 +40,7 @@ from moge.train.losses import (
     monitoring, 
     scale_shift_loss,
     gram_anchoring_loss,
+    temporal_loss
 )
 from moge.train.utils import build_optimizer, build_lr_scheduler
 from moge.utils.geometry_torch import intrinsics_to_fov
@@ -319,8 +320,11 @@ def main(
                     loss_list, weight_list = [], []
                     gt_metric_scale = None
                     gt_shift = None
+                    scale_list, shift_list = [], []
                     for b in range(current_batch_size):
                         if label_type[b*sequence_length] == 'invalid':
+                            scale_list.append(None)
+                            shift_list.append(None)
                             continue
                         align_method = config['loss'].get('align_method', 'scale_from_first_frame')
                         if align_method == 'scale_from_first_frame':
@@ -330,6 +334,8 @@ def main(
                             sequence_gt_mask_b = gt_mask[b * sequence_length:b * sequence_length + 1]
                             gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
                                                         sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
+                            scale_list.append(gt_metric_scale_b)
+                            shift_list.append(gt_shift_b)
                         else:
                             # This alignment method is to use the whole sequence to compute the scale and shift
                             sequence_pred_points_b = pred_points[b * sequence_length:(b + 1) * sequence_length]
@@ -337,6 +343,8 @@ def main(
                             sequence_gt_mask_b = gt_mask[b * sequence_length:(b + 1) * sequence_length]
                             gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
                                                         sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
+                            scale_list.append(gt_metric_scale_b)
+                            shift_list.append(gt_shift_b)
                         for j in range(sequence_length):
                             i = b * sequence_length + j
                             loss_dict, weight_dict, misc_dict = {}, {}, {}
@@ -387,6 +395,12 @@ def main(
                         loss_gram_anchoring, _ = gram_anchoring_loss(feature_before_stabilizer, feature_after_stabilizer)
                         loss_list.append(loss_gram_anchoring)
                         records.append({'loss_gram_anchoring': loss_gram_anchoring.item()})
+                    
+                    enable_temporal_loss = config['loss'].get('enable_temporal_loss', False)
+                    if enable_temporal_loss and None not in scale_list:
+                        loss_temporal, _ = temporal_loss(pred_points, gt_points, gt_mask, current_batch_size, scale_list, shift_list)
+                        loss_list.append(0.01 * loss_temporal)
+                        records.append({'loss_temporal': loss_temporal.item()})
 
                     loss = sum(loss_list) / len(loss_list)
                     
