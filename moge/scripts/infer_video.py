@@ -147,7 +147,8 @@ def main(
         save_path = Path(frames_output_dir, Path(video_path).stem)
         save_path.mkdir(exist_ok=True, parents=True)
 
-        min_disp, max_disp = np.nanquantile(disp_preds, 0.01), np.nanquantile(disp_preds, 0.99)
+        min_disp, max_disp = np.nanquantile(disp_preds, 0.02), np.nanquantile(disp_preds, 0.98)
+        disp_preds = np.clip(disp_preds, min_disp, max_disp)
         depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp)
 
     if vis_normal:
@@ -244,6 +245,6 @@ def main(
             output_path = output_path.replace('.mp4', '_w_normal.mp4')
         elif vis_feature:
             output_path = output_path.replace('.mp4', '_w_feature.mp4')
-        mediapy.write_video(output_path, grid_video, fps=10, crf=18)
+        mediapy.write_video(output_path, grid_video, fps=target_fps, crf=18)
 if __name__ == '__main__':
     main()

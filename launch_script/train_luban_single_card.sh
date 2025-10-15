@@ -19,5 +19,5 @@ accelerate launch \
     --vis_every 500 \
     --enable_mlflow True \
     --enable_mixed_precision False \
-    --num_iterations 400000 \
+    --num_iterations 40000 \
     --save_every 500
