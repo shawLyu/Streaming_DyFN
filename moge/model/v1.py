@@ -451,15 +451,15 @@ class MoGeModel(nn.Module):
 
         points_list = []
         masks_list = []
-        feature_list = []
         # Get intermediate layers from the backbone
         prev_state = None
         h_next = None
         p_next = None
-        feats = [[] for _ in range(self.intermediate_layers)]
-        cls_tokens = [[] for _ in range(self.intermediate_layers)]
         features_before_stabilizer_list = []
         features_after_stabilizer_list = []
+
+        focal_list = []
+        shift_list = []
         for i in tqdm(range(image_14.shape[0]), desc="Processing frames"):
             features = self.backbone.get_intermediate_layers(image_14[i][None, ...], self.intermediate_layers, return_class_token=True)
             if self.head.stabilizer_type == 'Kalman':
@@ -479,26 +479,33 @@ class MoGeModel(nn.Module):
                 # Post-process points and mask
                 points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
                 points = self._remap_points(points)     # slightly improves the performance in case of very large output values
-                points_list.append(points)
-                masks_list.append(mask)
+
+            mask_binary_i = mask > self.mask_threshold
+            focal_i, shift_i = recover_focal_shift(points, mask_binary_i)
+            focal_list.append(focal_i.cpu())
+            shift_list.append(shift_i.cpu())
+            points_list.append(points.cpu())
+            masks_list.append(mask.cpu())
         
         features_before_stabilizer_list = torch.concat(features_before_stabilizer_list, dim=0)
         features_after_stabilizer_list = torch.concat(features_after_stabilizer_list, dim=0)
-        points = torch.concat(points_list, dim=0)
-        mask = torch.concat(masks_list, dim=0)
+        points = torch.concat(points_list, dim=0).cpu()
+        mask = torch.concat(masks_list, dim=0).cpu()
 
-        mask_binary = mask > self.mask_threshold
+        focal = torch.concat(focal_list, dim=0).cpu()
+        shift = torch.concat(shift_list, dim=0).cpu()
 
-        # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
-        if fov_x is None:
-            focal, shift = recover_focal_shift(points, mask_binary)
-            focal = focal.mean(dim=0).expand(points.shape[0])
-            shift = shift.mean(dim=0).expand(points.shape[0])
-        else:
-            focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
-            if focal.ndim == 0:
-                focal = focal[None].expand(points.shape[0])
-            _, shift = recover_focal_shift(points, mask_binary, focal=focal)
+        mask_binary = (mask > self.mask_threshold).cpu()
+        # # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
+        # if fov_x is None:
+        #     focal, shift = recover_focal_shift(points, mask_binary)
+        #     focal = focal.mean(dim=0).expand(points.shape[0])
+        #     shift = shift.mean(dim=0).expand(points.shape[0])
+        # else:
+        #     focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
+        #     if focal.ndim == 0:
+        #         focal = focal[None].expand(points.shape[0])
+        #     _, shift = recover_focal_shift(points, mask_binary, focal=focal)
         fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
         fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
         intrinsics = utils3d.torch.intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
@@ -512,8 +519,8 @@ class MoGeModel(nn.Module):
 
         # Apply mask if needed
         if apply_mask:
-            points = torch.where(mask_binary[..., None], points, torch.inf)
-            depth = torch.where(mask_binary, depth, torch.inf)
+            points = torch.where(mask_binary[..., None].cpu(), points.cpu(), torch.inf)
+            depth = torch.where(mask_binary.cpu(), depth.cpu(), torch.inf)
 
         return_dict = {
             'points': points,

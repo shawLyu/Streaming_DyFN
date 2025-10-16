@@ -58,6 +58,15 @@
                 "depth": "depth.png",
                 "weight": 8.0,
                 "fov_range_absolute": [60, 120]
+            },
+            {
+                "name": "irs",
+                "path": "data/moge_process_dataset/irs",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 5.8,
+                "center_augmentation": 0.25
             }
         ]
     },
