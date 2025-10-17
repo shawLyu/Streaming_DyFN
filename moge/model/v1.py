@@ -495,6 +495,9 @@ class MoGeModel(nn.Module):
         focal = torch.concat(focal_list, dim=0).cpu()
         shift = torch.concat(shift_list, dim=0).cpu()
 
+        focal = focal.mean(dim=0).expand(points.shape[0])
+        shift = shift.mean(dim=0).expand(points.shape[0])
+
         mask_binary = (mask > self.mask_threshold).cpu()
         # # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
         # if fov_x is None:

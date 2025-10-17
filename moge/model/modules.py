@@ -615,8 +615,8 @@ class RecurrentFeatureStabilizer(nn.Module):
 
         return self.ema_mean, self.ema_std
 
-    def forward(self, x: torch.Tensor, prev_state: Optional[torch.Tensor] = None
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, prev_state: Optional[torch.Tensor] = None, 
+                ema_only: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for one time step.
         
