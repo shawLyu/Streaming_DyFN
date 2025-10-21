@@ -6,7 +6,7 @@ CFG=${1:-"configs/train/video_finetune_local_tartanair.json"}
 WORKSPACE=${2:-"workspace/video_finetune_local_bug_fixed"}
 
 accelerate launch \
-    --num_processes 2 \
+    --num_processes 1 \
     moge/scripts/train.py \
     --config $CFG \
     --workspace $WORKSPACE \

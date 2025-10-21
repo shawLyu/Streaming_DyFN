@@ -324,7 +324,7 @@ def temporal_loss(pred_points: torch.Tensor, gt_points: torch.Tensor, mask: torc
     scaled_pred_points = torch.stack(scaled_pred_points, dim=0)
 
     temporal_loss = 0
-    for k in [1, 2, 4]:
+    for k in [1, 2, 4, 8]:
         pred_diff_k = scaled_pred_points[..., :-k, :, :, :] - scaled_pred_points[..., k:, :, :, :]
         gt_diff_k = gt_points[..., :-k, :, :, :] - gt_points[..., k:, :, :, :]
 
@@ -332,14 +332,10 @@ def temporal_loss(pred_points: torch.Tensor, gt_points: torch.Tensor, mask: torc
 
         mean_points_k = (gt_points[:, k:] + gt_points[:, :-k]) / 2
 
-        relative_change_k = gt_diff_k.abs() / (mean_points_k.abs() + 1e-6)
+        weight_k = (valid_diff_k).float() / mean_points_k[..., 2].clamp_min(1e-5)
+        weight_k = weight_k.clamp_max(10.0 * weighted_mean(weight_k, valid_diff_k, dim=(-2, -1), keepdim=True))   # In case your data contains extremely small depth values
 
-        small_change_mask_k = relative_change_k.mean(dim=-1) < 0.2
-
-        temporal_mask_k = valid_diff_k & small_change_mask_k
-
-        if temporal_mask_k.sum() > 0:
-            loss_k = F.l1_loss(pred_diff_k.sum(dim=-1)[temporal_mask_k], gt_diff_k.sum(dim=-1)[temporal_mask_k])
-            temporal_loss += loss_k
+        loss_k = _smooth((pred_diff_k - gt_diff_k).abs() * weight_k[..., None]).mean(dim=(-5, -4, -3, -2, -1))
+        temporal_loss += loss_k
 
     return temporal_loss, {}

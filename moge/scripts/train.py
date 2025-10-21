@@ -334,8 +334,6 @@ def main(
                             sequence_gt_mask_b = gt_mask[b * sequence_length:b * sequence_length + 1]
                             gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
                                                         sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
-                            scale_list.append(gt_metric_scale_b)
-                            shift_list.append(gt_shift_b)
                         else:
                             # This alignment method is to use the whole sequence to compute the scale and shift
                             sequence_pred_points_b = pred_points[b * sequence_length:(b + 1) * sequence_length]
@@ -343,8 +341,10 @@ def main(
                             sequence_gt_mask_b = gt_mask[b * sequence_length:(b + 1) * sequence_length]
                             gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
                                                         sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
-                            scale_list.append(gt_metric_scale_b)
-                            shift_list.append(gt_shift_b)
+
+                        scale_list.append(gt_metric_scale_b)
+                        shift_list.append(gt_shift_b)
+
                         for j in range(sequence_length):
                             i = b * sequence_length + j
                             loss_dict, weight_dict, misc_dict = {}, {}, {}
@@ -399,7 +399,7 @@ def main(
                     enable_temporal_loss = config['loss'].get('enable_temporal_loss', False)
                     if enable_temporal_loss and None not in scale_list:
                         loss_temporal, _ = temporal_loss(pred_points, gt_points, gt_mask, current_batch_size, scale_list, shift_list)
-                        loss_list.append(0.01 * loss_temporal)
+                        loss_list.append(loss_temporal)
                         records.append({'loss_temporal': loss_temporal.item()})
 
                     loss = sum(loss_list) / len(loss_list)
