@@ -399,7 +399,7 @@ def main(
                     enable_temporal_loss = config['loss'].get('enable_temporal_loss', False)
                     if enable_temporal_loss and None not in scale_list:
                         loss_temporal, _ = temporal_loss(pred_points, gt_points, gt_mask, current_batch_size, scale_list, shift_list)
-                        loss_list.append(loss_temporal)
+                        loss_list.append(0.1 * loss_temporal)
                         records.append({'loss_temporal': loss_temporal.item()})
 
                     loss = sum(loss_list) / len(loss_list)

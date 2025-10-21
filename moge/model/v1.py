@@ -67,7 +67,7 @@ class Head(nn.Module):
         if stabilizer_type == 'GRU':
             self.stabilizer = RecurrentFeatureStabilizerGRU(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
         elif stabilizer_type == 'ConvGRU':
-            self.stabilizer = RecurrentFeatureStabilizer(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
+            self.stabilizer = RecurrentFeatureStabilizerConvGRU(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
         elif stabilizer_type == 'Kalman':
             self.stabilizer = KalmanRecurrentStabilizer(dim_proj, stabilizer_hidden_dim, epsilon=1e-5)
         else:
@@ -145,9 +145,9 @@ class Head(nn.Module):
                 x = x.reshape(-1, *x.shape[2:])
             else:
                 if self.stabilizer_type == 'Kalman':
-                    x, h_next, p_next = self.stabilizer(x, h_next, p_next, ema_only=ema_only)
+                    x, h_next, p_next = self.stabilizer(x, h_next, p_next)
                 else:
-                    x, prev_state = self.stabilizer(x, prev_state, ema_only=ema_only)
+                    x, prev_state = self.stabilizer(x, prev_state)
         features_after_stabilizer = x.clone()
 
 
@@ -465,7 +465,7 @@ class MoGeModel(nn.Module):
             if self.head.stabilizer_type == 'Kalman':
                 output, h_next, p_next, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state=prev_state, h_next=h_next, p_next=p_next, inference_mode=True, image_based=image_based)
             else:
-                output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state, inference_mode=True, image_based=image_based, ema_only=ema_only)
+                output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image[i][None, ...], prev_state, inference_mode=True, image_based=image_based)
             features_before_stabilizer_list.append(features_before_stabilizer)
             features_after_stabilizer_list.append(features_after_stabilizer)
             points, mask = output

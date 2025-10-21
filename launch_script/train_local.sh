@@ -10,7 +10,7 @@ accelerate launch \
     moge/scripts/train.py \
     --config $CFG \
     --workspace $WORKSPACE \
-    --checkpoint workspace/v_MoGE_tune/gru_moge_scale_all_every_frame_gram_scale_first_frame/checkpoint/00039500.pt \
+    --checkpoint pretrained_moge/pretrained_moge.pt \
     --gradient_accumulation_steps 1 \
     --batch_size_forward 2 \
     --enable_gradient_checkpointing False \

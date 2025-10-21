@@ -66,6 +66,15 @@
                 "weight": 2.7,
                 "fov_range_absolute": [60, 120],
                 "image_augmentation": ["jittering", "jpeg_loss", "blurring", "shot_noise"]
+            },
+            {
+                "name": "pointodyssey",
+                "path": "data/moge_process_dataset/pointodyssey",
+                "label_type": "synthetic",
+                "index": "index.txt",
+                "depth": "depth.png",
+                "weight": 8.0,
+                "fov_range_absolute": [60, 120]
             }
         ]
     },
@@ -101,8 +110,9 @@
     },
     "low_resolution_training_steps": 10000,
     "loss": {
-        "align_method": "scale_all_frames",
-        "enable_gram_anchoring": true,
+        "align_method": "scale_from_first_frame",
+        "enable_gram_anchoring": false,
+        "enable_temporal_loss": true,
         "invalid": {},
         "synthetic": {
             "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},

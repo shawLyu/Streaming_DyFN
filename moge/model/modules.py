@@ -303,59 +303,78 @@ class ScaleShiftHead(nn.Module):
 
 class ConvGRUCell(nn.Module):
     """
-    A GRU Cell with convolutional gates.
-    The state is a feature map [B, C_hidden, H, W].
+    A basic Convolutional GRU cell.
+
+    Args:
+        input_dim (int): Number of channels in the input feature map.
+        hidden_dim (int): Number of channels in the hidden state feature map.
+        kernel_size (int): Size of the convolutional kernel.
+        bias (bool): Whether to add a learnable bias.
     """
-    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3):
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int, bias: bool = True):
         super(ConvGRUCell, self).__init__()
+
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        padding = kernel_size // 2
-        
-        # Convolution for the reset and update gates
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2  # Preserve spatial resolution
+        self.bias = bias
+
+        # A single convolution layer to compute gates for both input and hidden state, for efficiency.
+        # This layer computes the update and reset gates.
         self.conv_gates = nn.Conv2d(
             in_channels=input_dim + hidden_dim,
-            out_channels=2 * hidden_dim,  # z_t (update) and r_t (reset)
-            kernel_size=kernel_size,
-            padding=padding,
-            padding_mode='replicate'
-        )
-        
-        # Convolution for the candidate hidden state
-        self.conv_candidate = nn.Conv2d(
-            in_channels=input_dim + hidden_dim,
-            out_channels=hidden_dim,  # h_tilde_t
-            kernel_size=kernel_size,
-            padding=padding,
-            padding_mode='replicate'
+            out_channels=2 * hidden_dim,  # for update_gate, reset_gate
+            kernel_size=self.kernel_size,
+            padding=self.padding,
+            bias=self.bias
         )
 
-    def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        # This layer computes the candidate hidden state.
+        self.conv_candidate = nn.Conv2d(
+            in_channels=input_dim + hidden_dim,
+            out_channels=hidden_dim,  # for the new_gate (candidate)
+            kernel_size=self.kernel_size,
+            padding=self.padding,
+            bias=self.bias
+        )
+
+    def forward(self, input_tensor: torch.Tensor, h_cur: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
+        Forward pass.
+
         Args:
-            x_t (torch.Tensor): Input tensor at time t, [B, C_in, H, W]
-            h_prev (torch.Tensor): Hidden state from time t-1, [B, C_hidden, H, W]
+            input_tensor (torch.Tensor): Input tensor, shape [B, C_in, H, W].
+            h_cur (Optional[torch.Tensor]): Current hidden state, shape [B, C_hid, H, W].
+
+        Returns:
+            torch.Tensor: Next hidden state, shape [B, C_hid, H, W].
         """
-        # Concatenate input and previous hidden state
-        combined = torch.cat([x_t, h_prev], dim=1)  # [B, C_in + C_hidden, H, W]
-        
-        # Calculate gates
-        gates = self.conv_gates(combined)  # [B, 2 * C_hidden, H, W]
-        
-        # Split gates
-        z_t, r_t = torch.split(gates, self.hidden_dim, dim=1)
-        
-        # Apply activations
-        z_t = torch.sigmoid(z_t)  # Update gate
-        r_t = torch.sigmoid(r_t)  # Reset gate
-        
-        # Calculate candidate hidden state
-        combined_reset = torch.cat([x_t, r_t * h_prev], dim=1)
-        h_tilde_t = torch.tanh(self.conv_candidate(combined_reset))
-        
-        # Calculate new hidden state
-        h_t = (1.0 - z_t) * h_prev + z_t * h_tilde_t
-        
-        return h_t
+        if h_cur is None:
+            # Initialize hidden state with zeros if it's the first timestep
+            h_cur = torch.zeros(
+                input_tensor.shape[0], self.hidden_dim, 
+                input_tensor.shape[2], input_tensor.shape[3],
+                device=input_tensor.device
+            )
+
+        # Concatenate input and hidden state along the channel dimension
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+
+        # Compute the reset and update gates
+        combined_conv = self.conv_gates(combined)
+        gamma, beta = torch.split(combined_conv, self.hidden_dim, dim=1)
+        reset_gate = torch.sigmoid(gamma)
+        update_gate = torch.sigmoid(beta)
+
+        # Compute the candidate hidden state (new gate)
+        # Here we apply the reset gate to the hidden state
+        combined_candidate = torch.cat([input_tensor, reset_gate * h_cur], dim=1)
+        candidate_h = torch.tanh(self.conv_candidate(combined_candidate))
+
+        # Compute the next hidden state
+        h_next = (1 - update_gate) * h_cur + update_gate * candidate_h
+        return h_next
 
 
 class RecurrentFeatureStabilizerGRU(nn.Module):
@@ -515,174 +534,96 @@ class RecurrentFeatureStabilizerGRU(nn.Module):
 
 # --- 2. Your Modified RecurrentFeatureStabilizer ---
 
-# (Your original code, with ConvGRUCell merged in)
-class RecurrentFeatureStabilizer(nn.Module):
+class RecurrentFeatureStabilizerConvGRU(nn.Module):
     """
-    A learnable module to stabilize feature statistics over time.
-    
-    It uses a *ConvGRUCell* to maintain a "learnable EMA" of the feature
-    statistics (represented by a *hidden state map*). This hidden state
-    is then used to predict *spatially-varying* affine parameters (gamma, beta)
-    as a *residual* on top of a *global* EMA baseline.
-    """ # <-- MODIFIED Docstring
-    def __init__(self, feature_dim: int, hidden_dim: int, fixed_alpha: float = 0.1, epsilon: float = 1e-5):
+    A module that uses ConvGRU to stabilize features spatially.
+    It directly learns to predict the affine parameters (gamma and beta) for AdaIN.
+    """
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_dim: int,
+        kernel_size: int = 3,
+        epsilon: float = 1e-5,
+    ):
         """
         Args:
-            feature_dim (int): The number of channels 'd' in the input feature map.
-            hidden_dim (int): The size of the *ConvGRU's hidden state channels*. # <-- MODIFIED
-            epsilon (float): For numerical stability in normalization.
+            feature_dim (int): Number of channels 'd' in the input feature map.
+            hidden_dim (int): Number of channels in the ConvGRU's hidden state.
+            kernel_size (int): Size of the kernel within the ConvGRU cell.
+            epsilon (float): A small value for numerical stability.
         """
         super().__init__()
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.epsilon = epsilon
-        self.fixed_alpha = fixed_alpha
 
-        # --- Baseline Path (Global EMA) ---
-        # This logic is UNCHANGED.
-        self.register_buffer("ema_mean", None, persistent=True)
-        self.register_buffer("ema_std", None, persistent=True)
-        
-        # --- Correction Path (Local ConvGRU) ---
-        # This path is now spatially-aware.
-        self.gru_cell = ConvGRUCell(
-            input_dim=feature_dim, 
+        # Core component: The custom ConvGRUCell we built
+        self.conv_gru_cell = ConvGRUCell(
+            input_dim=feature_dim,
             hidden_dim=hidden_dim,
-            kernel_size=3
-        ) # <-- MODIFIED (was nn.GRUCell)
-        
-        # These heads predict the *spatially-varying delta* (correction map)
-        self.gamma_delta_head = nn.Conv2d(
-            hidden_dim, 
-            feature_dim, 
-            kernel_size=1
-        ) # <-- MODIFIED (was nn.Linear)
-        self.beta_delta_head = nn.Conv2d(
-            hidden_dim, 
-            feature_dim, 
-            kernel_size=1
-        ) # <-- MODIFIED (was nn.Linear)
+            kernel_size=kernel_size
+        )
 
-        # self.initial_state_projector = nn.Sequential(
-        #             nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1, padding_mode='replicate'),
-        #             nn.Tanh() 
-        #         ) # <-- NEW
-        
-        # Initialize the delta heads to output zero
+        # Prediction heads: Use 1x1 convolutions to map the hidden state to gamma and beta.
+        # These are now tensors with the same spatial dimensions as the feature map.
+        self.gamma_head = nn.Conv2d(hidden_dim, feature_dim, kernel_size=1)
+        self.beta_head = nn.Conv2d(hidden_dim, feature_dim, kernel_size=1)
+
         self._init_weights()
 
     def _init_weights(self):
         """
-        Initializes the delta heads to output zero.
-        (This function works for both nn.Linear and nn.Conv2d)
+        Initializes weights so the module acts as an identity transformation
+        at the beginning of training. Gamma is initialized to 1, and beta to 0.
         """
-        print("Initializing HybridRecurrentStabilizer: Delta heads set to zero.")
-        for head in [self.gamma_delta_head, self.beta_delta_head]:
-            nn.init.constant_(head.weight, 0.0)
-            nn.init.constant_(head.bias, 0.0)
+        print("Initializing ConvGRU Stabilizer: gamma->0, beta->0.")
+        nn.init.constant_(self.gamma_head.weight, 0.0)
+        nn.init.constant_(self.gamma_head.bias, 0.0) # Initialize bias to output 1
+        nn.init.constant_(self.beta_head.weight, 0.0)
+        nn.init.constant_(self.beta_head.bias, 0.0) # Initialize bias to output 0
 
-    def _update_ema_stats(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        prev_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Updates the fixed EMA baseline statistics.
-        This is the non-learnable "safety net".
-        THIS FUNCTION IS UNCHANGED.
-        """
-        # Calculate current stats (detached from graph)
-        B = x.shape[0]
-        mu_t = torch.mean(x, dim=[2, 3], keepdim=False).detach() # [B, D]
-        std_t = torch.std(x, dim=[2, 3], keepdim=False).detach()  # [B, D]
+        Forward pass for a single timestep.
 
-        if self.ema_mean is None:
-            # First frame
-            self.ema_mean = mu_t.clone()
-            self.ema_std = std_t.clone()
-        else:
-            # Apply fixed EMA update
-            # We must update the buffer data directly
-            # Handle potential batch size mismatches (e.g., last batch)
-            if B == self.ema_mean.shape[0]:
-                self.ema_mean.data = (self.fixed_alpha * mu_t + 
-                                      (1 - self.fixed_alpha) * self.ema_mean.data)
-                self.ema_std.data = (self.fixed_alpha * std_t + 
-                                     (1 - self.fixed_alpha) * self.ema_std.data)
-            else:
-                # If batch size is different, just use the first sample
-                # to update the first EMA stat (a reasonable heuristic)
-                self.ema_mean.data[0:B] = (self.fixed_alpha * mu_t + 
-                                          (1 - self.fixed_alpha) * self.ema_mean.data[0:B])
-                self.ema_std.data[0:B] = (self.fixed_alpha * std_t + 
-                                         (1 - self.fixed_alpha) * self.ema_std.data[0:B])
-
-        return self.ema_mean, self.ema_std
-
-    def forward(self, x: torch.Tensor, prev_state: Optional[torch.Tensor] = None, 
-                ema_only: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for one time step.
-        
         Args:
-            x (torch.Tensor): Current frame's features, shape [B, D, H, W].
-            prev_state (Optional[torch.Tensor]): Previous hidden state *map* from ConvGRU.
-                                                 Shape: [B, hidden_dim, H, W]. # <-- MODIFIED comment
-        
+            x (torch.Tensor): Features of the current frame, shape [B, D, H, W].
+            prev_state (Optional[torch.Tensor]): Hidden state from the previous timestep,
+                                                 shape [B, hidden_dim, H, W].
+
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
-                - x_stable (torch.Tensor): Stabilized features, [B, D, H, W].
-                - next_state (torch.Tensor): New hidden state *map*, [B, hidden_dim, H, W]. # <-- MODIFIED comment
+                - x_stable (torch.Tensor): The stabilized features, [B, D, H, W].
+                - next_state (torch.Tensor): The new hidden state, [B, hidden_dim, H, W].
         """
-        B, D, H, W = x.shape
-        
-        # --- 1. Baseline Path ---
-        # This logic is UNCHANGED.
-        # mu_base and std_base have shape [B, D]
-        mu_base, std_base = self._update_ema_stats(x)
-        
-        # --- 2. Correction Path (Learnable) ---
-        # x_pooled = F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1) # [B, D] # <-- DELETED
-        
-        # first_frame = False
-        if prev_state is None:
-            # first_frame = True
-            # prev_state = self.initial_state_projector(x) # <-- MODIFIED (is 4D map)
-            prev_state = torch.zeros(B, self.hidden_dim, H, W, dtype=x.dtype, device=x.device) # <-- MODIFIED (is 4D map)
-            
-        # Update the hidden state *map*
-        next_state = self.gru_cell(x, prev_state) # <-- MODIFIED (input is x, not x_pooled)
-        
-        # Predict the *spatially-varying correction* (delta map)
-        # These now have shape [B, D, H, W]
-        gamma_delta = self.gamma_delta_head(next_state) # <-- MODIFIED (output is 4D map)
-        beta_delta = self.beta_delta_head(next_state)   # <-- MODIFIED (output is 4D map)
-        
-        # --- 3. Combine Paths ---
-        # Broadcast global baseline [B, D] -> [B, D, 1, 1]
-        std_base_bcast = std_base.unsqueeze(-1).unsqueeze(-1) # <-- NEW
-        mu_base_bcast = mu_base.unsqueeze(-1).unsqueeze(-1)  # <-- NEW
+        # 1. Update the hidden state
+        # The input is the current feature map x and the previous hidden state
+        next_state = self.conv_gru_cell(x, prev_state)
 
-        # Add the baseline (broadcasted) and the correction (local map)
-        gamma_final = torch.clamp(std_base_bcast + gamma_delta, min=self.epsilon) # <-- MODIFIED
-        beta_final = mu_base_bcast + beta_delta # <-- MODIFIED
-        
-        # --- 4. Apply Normalization ---
-        # This logic is UNCHANGED.
-        # We still use global Instance Norm for the base normalization.
-        mu_x = torch.mean(x, dim=[2, 3], keepdim=True)  # [B, D, 1, 1]
-        std_x = torch.std(x, dim=[2, 3], keepdim=True)   # [B, D, 1, 1]
-        
-        # Normalize
+        # 2. Predict gamma and beta from the new hidden state
+        # Note: gamma and beta are now tensors of shape [B, D, H, W]
+        gamma_delta = self.gamma_head(next_state)
+        beta_delta = self.beta_head(next_state)
+
+        # 3. Apply AdaIN (Instance Normalization + Affine Transform)
+        # Calculate statistics of the current input x
+        mu_x = torch.mean(x, dim=[2, 3], keepdim=True)
+        std_x = torch.std(x, dim=[2, 3], keepdim=True)
+
+        # Normalize the input
         x_norm = (x - mu_x) / (std_x + self.epsilon)
-        
-        # Reshape gamma/beta for broadcasting: [B, D] -> [B, D, 1, 1]
-        # gamma_final = gamma_final.unsqueeze(-1).unsqueeze(-1) # <-- DELETED (gamma_final is already 4D)
-        # beta_final = beta_final.unsqueeze(-1).unsqueeze(-1)  # <-- DELETED (beta_final is already 4D)
-        
-        # Apply combined (and now spatially-varying) scale and shift
-        # This is now [B,D,H,W] * [B,D,H,W] + [B,D,H,W]
-        # if not first_frame:
+
+        gamma_final = torch.clamp(std_x + gamma_delta, min=self.epsilon)
+        beta_final = mu_x + beta_delta
+
+        # Apply the learned, spatially-varying gamma and beta
         x_stable = gamma_final * x_norm + beta_final
-        # else:
-            # x_stable = x
-        
+
         return x_stable, next_state
 
 
