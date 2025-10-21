@@ -22,6 +22,8 @@ def colorize_depth_video(disps: np.ndarray, mask: np.ndarray = None, normalize: 
         disp: [n, h, w]
         mask: [n, h, w]
     '''
+    if mask is not None:
+        disps = np.where(mask, disps, np.nan)
     if normalize and min_disp is not None and max_disp is not None:
         disps = (disps - min_disp) / (max_disp - min_disp)
 

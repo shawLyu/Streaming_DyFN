@@ -36,6 +36,7 @@ class TrainDataLoaderPipeline:
         self.depth_interpolation = config.get('depth_interpolation', 'bilinear')
         self.sampled_sequence_length = config.get('sampled_sequence_length', 3)
         self.sampling_stride = config.get('sampling_stride', 3)
+        self.sampling_type = config.get('sampling_type', 'weight')
 
         if 'image_sizes' in config:
             self.image_size_strategy = 'fixed'
@@ -68,16 +69,32 @@ class TrainDataLoaderPipeline:
         self.dataset_names = [dataset['name'] for dataset in config['datasets']]
         self.dataset_weights = [dataset['weight'] for dataset in config['datasets']]
 
-        # Build pipeline
-        self.pipeline = pipeline.Sequential([
-            self._sample_batch,
-            pipeline.Unbatch(),
-            pipeline.Parallel([self._load_instance] * num_load_workers),
-            pipeline.Parallel([self._process_instance] * num_process_workers),
-            pipeline.Batch(self.batch_size * self.sampled_sequence_length),
-            self._collate_batch,
-            pipeline.Buffer(buffer_size),
-        ])
+
+        if self.sampling_type == 'epoch':
+            self.sample_index = self._create_epoch_index()
+            self.pipeline = pipeline.Sequential([
+                self._sample_batch,
+                pipeline.Unbatch(),
+                pipeline.Parallel([self._load_instance] * num_load_workers),
+                pipeline.Parallel([self._process_instance] * num_process_workers),
+                pipeline.Batch(self.batch_size * self.sampled_sequence_length),
+                self._collate_batch,
+                pipeline.Buffer(buffer_size),
+            ])
+        elif self.sampling_type == 'weight':
+            self.dataset_samples_index = self._create_dataset_samples_index()
+            self.pipeline = pipeline.Sequential([
+                self._sample_batch_weight,
+                pipeline.Unbatch(),
+                pipeline.Parallel([self._load_instance] * num_load_workers),
+                pipeline.Parallel([self._process_instance] * num_process_workers),
+                pipeline.Batch(self.batch_size * self.sampled_sequence_length),
+                self._collate_batch,
+                pipeline.Buffer(buffer_size),
+            ])
+        else:
+            raise ValueError(f"Invalid sampling type: {self.sampling_type}")
+
 
         self.invalid_instance = {
             'intrinsics': np.array([[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]], dtype=np.float32),
@@ -88,36 +105,69 @@ class TrainDataLoaderPipeline:
             'label_type': 'invalid',
         }
 
-    def _sample_batch(self):
-        batch_id = 0
-        last_area = None
-        while True:
-            # Depending on the sample strategy, choose a dataset and a filename
-            batch = []
-            
-            # Sample instances
-            for _ in range(self.batch_size):
-                dataset_name = random.choices(self.dataset_names, weights=self.dataset_weights)[0]
-                sequence_name = random.choice(self.datasets[dataset_name]['sequences'])
-                sequence_filenames = self.datasets[dataset_name]['sequence_to_files'][sequence_name]
-                # Sample k continuous frames from the sequence
-                if len(sequence_filenames) < self.sampled_sequence_length * self.sampling_stride:
-                    # If sequence is too short, just repeat the last frame
-                    repeated_length = self.sampled_sequence_length - len(sequence_filenames[::self.sampling_stride])
-                    sampled_filenames = sequence_filenames[::self.sampling_stride] + [sequence_filenames[-1]] * repeated_length
-                else:
-                    # Randomly select a starting point that allows k continuous frames
-                    # Sample k frames with stride n
-                    max_start = len(sequence_filenames) - (self.sampled_sequence_length - 1) * self.sampling_stride
-                    start_idx = random.randint(0, max_start - 1)
-                    sampled_filenames = [sequence_filenames[start_idx + i*self.sampling_stride] for i in range(self.sampled_sequence_length)]
 
+    def _sample_batch_weight(self):
+        """
+        An epoch-based batch sampler that respects dataset sampling weights.
+        It builds each epoch by over/under-sampling from datasets according to their weights.
+        """
+        sequences_for_next_batch = []
+        epoch = 0
+        
+        # Define the nominal size of one epoch. Here we use the total number of unique samples.
+        epoch_size = sum(len(s) for s in self.dataset_samples_index.values())
+        
+        # Normalize dataset weights
+        total_weight = sum(self.dataset_weights)
+        normalized_weights = [w / total_weight for w in self.dataset_weights]
+
+        # This outer loop represents infinite epochs
+        while True:
+            epoch += 1
+            print(f"Starting Epoch {epoch}...")
+
+            # --- Dynamically build the list of samples for this epoch based on weights ---
+            indices_for_this_epoch = []
+            for i, dataset_name in enumerate(self.dataset_names):
+                num_samples_to_draw = int(normalized_weights[i] * epoch_size)
+                all_samples_from_d = self.dataset_samples_index[dataset_name]
+
+                if not all_samples_from_d: # Skip if a dataset has no samples
+                    continue
+
+                # If we need more samples than available (Oversampling)
+                if num_samples_to_draw > len(all_samples_from_d):
+                    # Sample with replacement
+                    sampled_indices = random.choices(all_samples_from_d, k=num_samples_to_draw)
+                    indices_for_this_epoch.extend(sampled_indices)
+                # If we need fewer samples than available (Undersampling)
+                else:
+                    # Sample without replacement
+                    sampled_indices = random.sample(all_samples_from_d, k=num_samples_to_draw)
+                    indices_for_this_epoch.extend(sampled_indices)
+            
+            # Shuffle the combined list for the epoch
+            random.shuffle(indices_for_this_epoch)
+            print(f"Epoch {epoch} will have {len(indices_for_this_epoch)} samples, constructed based on weights.")
+
+            # --- The rest of the logic is the same as before ---
+            # Iterate through the dynamically built and shuffled index
+            for dataset_name, sequence_name, start_idx in indices_for_this_epoch:
+                
+                sequence_filenames = self.datasets[dataset_name]['sequence_to_files'][sequence_name]
+
+                if start_idx == -1: 
+                    base_filenames = sequence_filenames[::self.sampling_stride]
+                    repeated_length = self.sampled_sequence_length - len(base_filenames)
+                    sampled_filenames = base_filenames + [sequence_filenames[-1]] * repeated_length
+                else:
+                    sampled_filenames = [sequence_filenames[start_idx + i * self.sampling_stride] for i in range(self.sampled_sequence_length)]
+                
                 seed = random.randint(0, 2 ** 32 - 1)
                 for filename in sampled_filenames:
-                    batch_id += 1
                     path = Path(self.datasets[dataset_name]['path'], filename)
                     instance = {
-                        'batch_id': batch_id,
+                        'epoch': epoch,
                         'seed': seed,
                         'dataset': dataset_name,
                         'filename': filename,
@@ -125,24 +175,94 @@ class TrainDataLoaderPipeline:
                         'label_type': self.datasets[dataset_name]['label_type'],
                         'sequence_name': sequence_name,
                     }
-                    batch.append(instance)
+                    sequences_for_next_batch.append(instance)
 
-            # Decide the image size for this batch
-            if self.image_size_strategy == 'fixed':
-                width, height = random.choice(self.config['image_sizes'])
-            elif self.image_size_strategy == 'aspect_area':
-                area = random.uniform(*self.area_range)
-                aspect_ratio_ranges = [self.datasets[instance['dataset']].get('aspect_ratio_range', self.aspect_ratio_range) for instance in batch]
-                aspect_ratio_range = (min(r[0] for r in aspect_ratio_ranges), max(r[1] for r in aspect_ratio_ranges))
-                aspect_ratio = random.uniform(*aspect_ratio_range)
-                width, height = int((area * aspect_ratio) ** 0.5), int((area / aspect_ratio) ** 0.5)
-            else:
-                raise ValueError('Invalid image size strategy')
-            
-            for instance in batch:
-                instance['width'], instance['height'] = width, height
-            
-            yield batch
+                if len(sequences_for_next_batch) >= self.batch_size * self.sampled_sequence_length:
+                    batch = sequences_for_next_batch[:self.batch_size * self.sampled_sequence_length]
+                    sequences_for_next_batch = sequences_for_next_batch[self.batch_size * self.sampled_sequence_length:]
+
+                    if self.image_size_strategy == 'fixed':
+                        width, height = random.choice(self.config['image_sizes'])
+                    elif self.image_size_strategy == 'aspect_area':
+                        area = random.uniform(*self.area_range)
+                        aspect_ratio_ranges = [self.datasets[instance['dataset']].get('aspect_ratio_range', self.aspect_ratio_range) for instance in batch]
+                        aspect_ratio_range = (min(r[0] for r in aspect_ratio_ranges), max(r[1] for r in aspect_ratio_ranges))
+                        aspect_ratio = random.uniform(*aspect_ratio_range)
+                        width, height = int((area * aspect_ratio) ** 0.5), int((area / aspect_ratio) ** 0.5)
+                    else:
+                        raise ValueError('Invalid image size strategy')
+                    
+                    for instance in batch:
+                        instance['width'], instance['height'] = width, height
+                    yield batch
+
+    def _sample_batch(self):
+        """
+        An epoch-based batch sampler that ensures all data is iterated through once per epoch.
+        This generator yields batches indefinitely, starting a new shuffled epoch each time.
+        """
+        sequences_for_next_batch = []
+        epoch_index = 0
+        
+        # This outer loop represents infinite epochs
+        while True:
+            # Shuffle the master index at the beginning of each epoch
+            epoch_index += 1
+            print(f"Starting epoch {epoch_index}")
+            indices = self.sample_index.copy()
+            random.shuffle(indices)
+
+            # Iterate through the shuffled index
+            for dataset_name, sequence_name, start_idx in indices:
+                
+                sequence_filenames = self.datasets[dataset_name]['sequence_to_files'][sequence_name]
+
+                # --- Get the list of filenames for this specific sample ---
+                if start_idx == -1: # Special case for short sequences
+                    # If sequence is too short, just repeat the last frame
+                    base_filenames = sequence_filenames[::self.sampling_stride]
+                    repeated_length = self.sampled_sequence_length - len(base_filenames)
+                    sampled_filenames = base_filenames + [sequence_filenames[-1]] * repeated_length
+                else: # Standard case for sequences that are long enough
+                    sampled_filenames = [sequence_filenames[start_idx + i * self.sampling_stride] for i in range(self.sampled_sequence_length)]
+                
+                # --- Create instance dictionaries for the sequence ---
+                # A single seed is shared across frames of the same sampled sequence for consistent augmentation
+                seed = random.randint(0, 2 ** 32 - 1)
+                for filename in sampled_filenames:
+                    path = Path(self.datasets[dataset_name]['path'], filename)
+                    instance = {
+                        'seed': seed,
+                        'dataset': dataset_name,
+                        'filename': filename,
+                        'path': path,
+                        'label_type': self.datasets[dataset_name]['label_type'],
+                        'sequence_name': sequence_name,
+                    }
+                    sequences_for_next_batch.append(instance)
+
+                # --- Yield a full batch when ready ---
+                if len(sequences_for_next_batch) >= self.batch_size * self.sampled_sequence_length:
+                    # Get exactly one batch worth of instances
+                    batch = sequences_for_next_batch[:self.batch_size * self.sampled_sequence_length]
+                    sequences_for_next_batch = sequences_for_next_batch[self.batch_size * self.sampled_sequence_length:]
+
+                    # Decide the image size for this batch (same logic as before)
+                    if self.image_size_strategy == 'fixed':
+                        width, height = random.choice(self.config['image_sizes'])
+                    elif self.image_size_strategy == 'aspect_area':
+                        area = random.uniform(*self.area_range)
+                        aspect_ratio_ranges = [self.datasets[instance['dataset']].get('aspect_ratio_range', self.aspect_ratio_range) for instance in batch]
+                        aspect_ratio_range = (min(r[0] for r in aspect_ratio_ranges), max(r[1] for r in aspect_ratio_ranges))
+                        aspect_ratio = random.uniform(*aspect_ratio_range)
+                        width, height = int((area * aspect_ratio) ** 0.5), int((area / aspect_ratio) ** 0.5)
+                    else:
+                        raise ValueError('Invalid image size strategy')
+                    
+                    for instance in batch:
+                        instance['width'], instance['height'] = width, height
+                    
+                    yield batch
 
     def _load_instance(self, instance: dict):
         try:
@@ -360,4 +480,54 @@ class TrainDataLoaderPipeline:
         self.pipeline.join()
         return False
 
+    def _create_epoch_index(self):
+        """
+        Pre-calculates an index of all possible samples for epoch-based iteration.
+        A sample is defined as a tuple of (dataset_name, sequence_name, start_idx).
+        """
+        print("Creating a master index of all samples for epoch-based sampling...")
+        sample_index = []
+        for dataset_name in self.dataset_names:
+            dataset = self.datasets[dataset_name]
+            for sequence_name in dataset['sequences']:
+                sequence_filenames = dataset['sequence_to_files'][sequence_name]
+                
+                # Handle sequences that are too short
+                if len(sequence_filenames) < self.sampled_sequence_length * self.sampling_stride:
+                    # For short sequences, there's only one way to sample them.
+                    # We use a special start_idx of -1 to signify this case.
+                    sample_index.append((dataset_name, sequence_name, -1))
+                else:
+                    # For longer sequences, create a sample for each possible starting point
+                    max_start = len(sequence_filenames) - (self.sampled_sequence_length - 1) * self.sampling_stride
+                    for start_idx in range(max_start):
+                        sample_index.append((dataset_name, sequence_name, start_idx))
+        print(f"Master index created with {len(sample_index)} unique samples.")
+        return sample_index
+
+    def _create_dataset_samples_index(self):
+        """
+        Pre-calculates an index of all possible samples, grouped by dataset.
+        Returns a dictionary: {dataset_name: [list_of_samples]}
+        """
+        print("Creating a master index of all samples, grouped by dataset...")
+        dataset_samples = {name: [] for name in self.dataset_names}
+        
+        for dataset_name in self.dataset_names:
+            dataset = self.datasets[dataset_name]
+            for sequence_name in dataset['sequences']:
+                sequence_filenames = dataset['sequence_to_files'][sequence_name]
+                
+                if len(sequence_filenames) < self.sampled_sequence_length * self.sampling_stride:
+                    # For short sequences, there's only one sample.
+                    dataset_samples[dataset_name].append((dataset_name, sequence_name, -1))
+                else:
+                    # For longer sequences, create a sample for each possible starting point.
+                    max_start = len(sequence_filenames) - (self.sampled_sequence_length - 1) * self.sampling_stride
+                    for start_idx in range(max_start):
+                        dataset_samples[dataset_name].append((dataset_name, sequence_name, start_idx))
+                        
+        total_samples = sum(len(s) for s in dataset_samples.values())
+        print(f"Master index created with {total_samples} unique samples across {len(self.dataset_names)} datasets.")
+        return dataset_samples
 

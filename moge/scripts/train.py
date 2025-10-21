@@ -518,10 +518,10 @@ def main(
                             idx = i_batch * batch_size_forward * sequence_length + i_instance
                             image_i = (image[i_instance].transpose(1, 2, 0) * 255).astype(np.uint8)
                             pred_points_i = pred_points[i_instance]
-                            pred_mask_i = pred_mask[i_instance]
+                            gt_mask_i = gt_mask[i_instance].cpu().numpy()
                             pred_depth_i = pred_depth[i_instance]
-                            pred_depth_i_valid = pred_depth_i[pred_mask_i & np.isfinite(pred_depth_i)].reshape(1, -1)
-                            gt_depth_i_valid = gt_depth[i_instance][pred_mask_i & np.isfinite(pred_depth_i)].reshape(1, -1)
+                            pred_depth_i_valid = pred_depth_i[gt_mask_i & np.isfinite(pred_depth_i)].reshape(1, -1)
+                            gt_depth_i_valid = gt_depth[i_instance][gt_mask_i & np.isfinite(pred_depth_i)].reshape(1, -1)
                             # Using lstsq to align the predicted depth with the ground truth depth
                             scale, shift = align_affine_lstsq(torch.from_numpy(pred_depth_i_valid).to(device), gt_depth_i_valid)
                             # save_dir.joinpath(f'{idx:04d}').mkdir(parents=True, exist_ok=True)
@@ -529,10 +529,10 @@ def main(
                             # cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/points.exr')), cv2.cvtColor(pred_points_i, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
                             # cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/mask.png')), pred_mask_i * 255)
                             # cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/depth_vis.png')), cv2.cvtColor(colorize_depth(pred_depth_i, pred_mask_i), cv2.COLOR_RGB2BGR))
-                            colored_depth_numpy.append(colorize_depth_video(1 / pred_depth_i, pred_mask_i, 
+                            colored_depth_numpy.append(colorize_depth_video(1 / pred_depth_i, gt_mask_i, 
                                                     min_disp=1 / max_pred_depth[i_instance // sequence_length], max_disp=1 / min_pred_depth[i_instance // sequence_length]))
                             pred_depth_i = scale.item() * pred_depth_i + shift.item()
-                            aligned_depth_numpy.append(colorize_depth_video(1 / pred_depth_i, pred_mask_i, 
+                            aligned_depth_numpy.append(colorize_depth_video(1 / pred_depth_i, gt_mask_i, 
                                                     min_disp=1 / max_gt_depth[i_instance // sequence_length], 
                                                     max_disp=1 / min_gt_depth[i_instance // sequence_length]))
                             image_numpy.append(image_i)
