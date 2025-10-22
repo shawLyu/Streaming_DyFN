@@ -481,7 +481,10 @@ class MoGeModel(nn.Module):
                 points = self._remap_points(points)     # slightly improves the performance in case of very large output values
 
             mask_binary_i = mask > self.mask_threshold
-            focal_i, shift_i = recover_focal_shift(points, mask_binary_i)
+            if len(focal_list) > 0:
+                focal_i, shift_i = recover_focal_shift(points, mask_binary_i, focal=focal_list[0].to(points.device))
+            else:
+                focal_i, shift_i = recover_focal_shift(points, mask_binary_i)
             focal_list.append(focal_i.cpu())
             shift_list.append(shift_i.cpu())
             points_list.append(points.cpu())

@@ -14,7 +14,7 @@ accelerate launch \
     --workspace $WORKSPACE \
     --gradient_accumulation_steps 1 \
     --batch_size_forward 4 \
-    --checkpoint pretrained_moge/pretrained_moge.pt \
+    --checkpoint workspace/v_MoGE_tune/conv_gru_temporal_loss_residual/checkpoint/00010000.pt \
     --enable_gradient_checkpointing False \
     --vis_every 500 \
     --enable_mlflow True \

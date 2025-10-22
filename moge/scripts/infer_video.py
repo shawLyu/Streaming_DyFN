@@ -148,7 +148,7 @@ def main(
         save_path.mkdir(exist_ok=True, parents=True)
 
         min_disp, max_disp = np.nanquantile(disp_preds, 0.02), np.nanquantile(disp_preds, 0.98)
-        # disp_preds = np.clip(disp_preds, min_disp, max_disp)
+        disp_preds = np.clip(disp_preds, min_disp, max_disp)
         depth_preds_color = colorize_depth_video(disp_preds, min_disp=min_disp, max_disp=max_disp)
 
     if vis_normal:

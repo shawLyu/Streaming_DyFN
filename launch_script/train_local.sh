@@ -6,11 +6,11 @@ CFG=${1:-"configs/train/video_finetune_local_tartanair.json"}
 WORKSPACE=${2:-"workspace/video_finetune_local_bug_fixed"}
 
 accelerate launch \
-    --num_processes 1 \
+    --num_processes 2 \
     moge/scripts/train.py \
     --config $CFG \
     --workspace $WORKSPACE \
-    --checkpoint pretrained_moge/pretrained_moge.pt \
+    --checkpoint workspace/v_MoGE_tune/conv_gru_temporal_loss_residual/checkpoint/00010000.pt \
     --gradient_accumulation_steps 1 \
     --batch_size_forward 2 \
     --enable_gradient_checkpointing False \
