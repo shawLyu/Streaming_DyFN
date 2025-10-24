@@ -618,8 +618,10 @@ class RecurrentFeatureStabilizerConvGRU(nn.Module):
         # Normalize the input
         x_norm = (x - mu_x) / (std_x + self.epsilon)
 
-        gamma_final = torch.clamp(std_x + gamma_delta, min=self.epsilon)
-        beta_final = mu_x + beta_delta
+        # gamma_final = torch.clamp(std_x + gamma_delta, min=self.epsilon)
+        # beta_final = mu_x + beta_delta
+        gamma_final = gamma_delta
+        beta_final = beta_delta
 
         # Apply the learned, spatially-varying gamma and beta
         x_stable = gamma_final * x_norm + beta_final
