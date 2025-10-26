@@ -579,7 +579,7 @@ class RecurrentFeatureStabilizerConvGRU(nn.Module):
         """
         print("Initializing ConvGRU Stabilizer: gamma->0, beta->0.")
         nn.init.constant_(self.gamma_head.weight, 0.0)
-        nn.init.constant_(self.gamma_head.bias, 0.0) # Initialize bias to output 1
+        nn.init.constant_(self.gamma_head.bias, 1.0) # Initialize bias to output 1
         nn.init.constant_(self.beta_head.weight, 0.0)
         nn.init.constant_(self.beta_head.bias, 0.0) # Initialize bias to output 0
 
@@ -607,8 +607,9 @@ class RecurrentFeatureStabilizerConvGRU(nn.Module):
 
         # 2. Predict gamma and beta from the new hidden state
         # Note: gamma and beta are now tensors of shape [B, D, H, W]
-        gamma_delta = self.gamma_head(next_state)
-        beta_delta = self.beta_head(next_state)
+        gamma = self.gamma_head(next_state)
+        gamma = F.softplus(gamma)
+        beta = self.beta_head(next_state)
 
         # 3. Apply AdaIN (Instance Normalization + Affine Transform)
         # Calculate statistics of the current input x
@@ -618,13 +619,8 @@ class RecurrentFeatureStabilizerConvGRU(nn.Module):
         # Normalize the input
         x_norm = (x - mu_x) / (std_x + self.epsilon)
 
-        # gamma_final = torch.clamp(std_x + gamma_delta, min=self.epsilon)
-        # beta_final = mu_x + beta_delta
-        gamma_final = gamma_delta
-        beta_final = beta_delta
-
         # Apply the learned, spatially-varying gamma and beta
-        x_stable = gamma_final * x_norm + beta_final
+        x_stable = gamma * x_norm + beta
 
         return x_stable, next_state
 

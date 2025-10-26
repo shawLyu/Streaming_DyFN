@@ -42,12 +42,12 @@ accelerate launch \
         --config $CFG \
         --workspace $WORKSPACE \
         --gradient_accumulation_steps 1 \
-        --batch_size_forward 1 \
-        --checkpoint pretrained_moge/image_pretrained_moge.pt \
+        --batch_size_forward 2 \
+        --checkpoint pretrained_moge/pretrained_moge.pt \
         --enable_gradient_checkpointing False \
         --vis_every 500 \
         --enable_mlflow True \
-        --enable_mixed_precision True \
+        --enable_mixed_precision False \
         --num_iterations 400000 \
         --save_every 1000 \
-        --log_every 1000
+        --log_every 500

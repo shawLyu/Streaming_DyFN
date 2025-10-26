@@ -111,7 +111,7 @@
     "low_resolution_training_steps": 10000,
     "loss": {
         "align_method": "scale_from_first_frame",
-        "enable_gram_anchoring": false,
+        "enable_gram_anchoring": true,
         "enable_temporal_loss": true,
         "invalid": {},
         "synthetic": {
@@ -119,7 +119,7 @@
             "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
             "patch_16": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 16, "align_resolution": 8, "num_patches": 256}},
             "patch_64": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 64, "align_resolution": 4, "num_patches": 4096}},
-            "normal": {"function": "normal_loss", "weight": 1.0},
+            "normal": {"function": "normal_loss", "weight": 2.0},
             "mask": {"function": "mask_l2_loss", "weight": 1.0}
         },
         "sfm": {
