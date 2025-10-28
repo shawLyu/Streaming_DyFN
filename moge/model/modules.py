@@ -607,9 +607,20 @@ class RecurrentFeatureStabilizerConvGRU(nn.Module):
 
         # 2. Predict gamma and beta from the new hidden state
         # Note: gamma and beta are now tensors of shape [B, D, H, W]
-        gamma = self.gamma_head(next_state)
-        gamma = F.softplus(gamma)
+        # gamma = self.gamma_head(next_state)
+        # gamma = F.softplus(gamma)
+        # gamma = torch.mean(gamma, dim=[2, 3], keepdim=True)  # This was the old method
+
+        # beta = self.beta_head(next_state)
+        # beta = torch.mean(beta, dim=[2, 3], keepdim=True)  # This was the old method
+
+        # -- LEARNABLE way --
+        # Instead of averaging, use an adaptive pooling to [B, D, 1, 1] (learnable heads already produce global info)
+        gamma = F.softplus(self.gamma_head(next_state))
+        gamma = F.adaptive_avg_pool2d(gamma, (1, 1))  # Output: [B, D, 1, 1]
+
         beta = self.beta_head(next_state)
+        beta = F.adaptive_avg_pool2d(beta, (1, 1))    # Output: [B, D, 1, 1]
 
         # 3. Apply AdaIN (Instance Normalization + Affine Transform)
         # Calculate statistics of the current input x
