@@ -334,13 +334,16 @@ def main(
                             sequence_gt_mask_b = gt_mask[b * sequence_length:b * sequence_length + 1]
                             gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
                                                         sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
-                        else:
+                        elif align_method == 'scale_from_sequence':
                             # This alignment method is to use the whole sequence to compute the scale and shift
                             sequence_pred_points_b = pred_points[b * sequence_length:(b + 1) * sequence_length]
                             sequence_gt_points_b = gt_points[b * sequence_length:(b + 1) * sequence_length]
                             sequence_gt_mask_b = gt_mask[b * sequence_length:(b + 1) * sequence_length]
                             gt_metric_scale_b, gt_shift_b = affine_invariant_global_loss(sequence_pred_points_b, sequence_gt_points_b, 
                                                         sequence_gt_mask_b, **config['loss'][label_type[b*sequence_length]]['global']['params'])
+                        else:
+                            gt_metric_scale_b = None
+                            gt_shift_b = None
 
                         scale_list.append(gt_metric_scale_b)
                         shift_list.append(gt_shift_b)
@@ -356,7 +359,8 @@ def main(
                                 if v['function'] == 'affine_invariant_global_loss':
                                     # NOTE: Adopt the global scale and shift for the local loss
                                     # TODO: add the option here
-                                    loss_dict[k], misc_dict[k], _, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=gt_metric_scale_b, gt_shift=gt_shift_b)
+                                    if gt_metric_scale_b is not None and gt_shift_b is not None:
+                                        loss_dict[k], misc_dict[k], _, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=gt_metric_scale_b, gt_shift=gt_shift_b)
                                     loss_dict[k+'_per_frame'], misc_dict[k+'_per_frame'], gt_metric_scale, gt_shift = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=None, gt_shift=None)
                                     # _, _, gt_metric_scale, gt_shift = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_mask[i], **v['params'], gt_metric_scale=None, gt_shift=None)
                                 elif v['function'] == 'affine_invariant_local_loss':

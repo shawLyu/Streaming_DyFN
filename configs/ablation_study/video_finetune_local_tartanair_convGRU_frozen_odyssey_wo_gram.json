@@ -111,7 +111,7 @@
     "low_resolution_training_steps": 10000,
     "loss": {
         "align_method": "scale_from_first_frame",
-        "enable_gram_anchoring": true,
+        "enable_gram_anchoring": false,
         "enable_temporal_loss": true,
         "invalid": {},
         "synthetic": {
