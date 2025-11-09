@@ -389,13 +389,6 @@ class MoGeModel(nn.Module):
             output, _, feature_before_stabilizer, feature_after_stabilizer = self.head.forward_recurrent(features, image, batch_size=B)
         points, mask = output
 
-        # # Predict scale and shift from the class token
-        # cls_token = features[-1][1].unsqueeze(0)
-        # scale = self.scale_shift_head(cls_token)
-        # # scale, shift = scale_shift.split(1, dim=-1)
-        # scale = scale.exp()
-        # print(scale)
-        
         # Make sure fp32 precision for output
         with torch.autocast(device_type=image.device.type, dtype=torch.float32):
             # Resize to original resolution
@@ -519,7 +512,7 @@ class MoGeModel(nn.Module):
 
         # If projection constraint is forced, recompute the point map using the actual depth map
         if force_projection:
-            points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
+            points = utils3d.pt.depth_map_to_point_map(depth, intrinsics=intrinsics)
         else:
             points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
 
@@ -549,7 +542,9 @@ class MoGeModel(nn.Module):
         num_tokens: int = None,
         apply_mask: bool = True,
         force_projection: bool = True,
-        use_fp16: bool = True,
+        use_fp16: bool = False,
+        image_based: bool = False,
+        prev_state: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         User-friendly inference function
@@ -588,13 +583,31 @@ class MoGeModel(nn.Module):
         if num_tokens is None:
             min_tokens, max_tokens = self.num_tokens_range
             num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
-        
+
+        resize_factor = ((num_tokens * 14 ** 2) / (original_height * original_width)) ** 0.5
+        resized_width, resized_height = int(original_width * resize_factor), int(original_height * resize_factor)
+        image = F.interpolate(image, (resized_height, resized_width), mode="bicubic", align_corners=False, antialias=True)
+        # Apply image transformation for DINOv2
+        image = (image - self.image_mean) / self.image_std
+        image = F.interpolate(image, (resized_height // 14 * 14, resized_width // 14 * 14), mode="bilinear", align_corners=False, antialias=True)
+
         with torch.autocast(device_type=image.device.type, dtype=torch.float16, enabled=use_fp16):
-            output = self.forward(image, num_tokens)
+            features = self.backbone.get_intermediate_layers(image, self.intermediate_layers, return_class_token=True)
+            output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image, prev_state, inference_mode=True, image_based=image_based)
 
         # # points, mask, scale, shift = output['points'], output['mask'], output['metric_scale'], output['shift']
         # points, mask, scale, shift = output['points'], output['mask'], output['metric_scale'], None
-        points, mask = output['points'], output['mask']
+        points, mask = output
+
+        with torch.autocast(device_type=image.device.type, dtype=torch.float32):
+            # Resize to original resolution
+            points = F.interpolate(points, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
+            mask = F.interpolate(mask, (original_height, original_width), mode='bilinear', align_corners=False, antialias=False)
+            
+            # Post-process points and mask
+            points, mask = points.permute(0, 2, 3, 1), mask.squeeze(1)
+            points = self._remap_points(points)     # slightly improves the performance in case of very large output values
+
 
         mask_binary = mask > self.mask_threshold
 
@@ -613,7 +626,7 @@ class MoGeModel(nn.Module):
 
         # If projection constraint is forced, recompute the point map using the actual depth map
         if force_projection:
-            points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
+            points = utils3d.pt.depth_map_to_point_map(depth, intrinsics=intrinsics)
         else:
             points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
 
@@ -634,7 +647,10 @@ class MoGeModel(nn.Module):
             'intrinsics': intrinsics,
             'depth': depth,
             'mask': mask_binary,
-            'mask_prob': torch.sigmoid(mask)
+            'mask_prob': torch.sigmoid(mask),
+            'feature_before_stabilizer': features_before_stabilizer,
+            'feature_after_stabilizer': features_after_stabilizer,
+            'prev_state': prev_state,
         }
 
         return return_dict
