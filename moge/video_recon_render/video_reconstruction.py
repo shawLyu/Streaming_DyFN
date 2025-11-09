@@ -45,7 +45,7 @@ def solve_pose_ransac(
     for _ in range(max_iters):
         maybe_inliers = np.random.choice(n, size=hypothetical_size, replace=False)
         try:
-            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='similar')
+            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='rigid')
         except np.linalg.LinAlgError:
             continue
         transformed_p = utils3d.np.transform_points(p, pose)
@@ -55,7 +55,7 @@ def solve_pose_ransac(
         score = inlier_thresh * n - np.clip(errors, None, inlier_thresh).sum()
         if score > best_score:
             best_score, best_inlines = score, inliers
-            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='similar')
+            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='rigid')
     
     return best_solution, best_inlines
 
@@ -122,6 +122,78 @@ def write_video(path: Union[str, os.PathLike], frames: List[np.ndarray], fps: in
     video.release()
 
 
+def write_ply(path: Union[str, os.PathLike], points: np.ndarray, colors: np.ndarray = None):
+    """
+    Write point cloud to PLY file format.
+    
+    Args:
+        path: Output PLY file path
+        points: Nx3 array of 3D points
+        colors: Optional Nx3 array of RGB colors (0-255)
+    """
+    num_points = points.shape[0]
+    
+    with open(path, 'w') as f:
+        # Write PLY header
+        f.write('ply\n')
+        f.write('format ascii 1.0\n')
+        f.write(f'element vertex {num_points}\n')
+        f.write('property float x\n')
+        f.write('property float y\n')
+        f.write('property float z\n')
+        if colors is not None:
+            f.write('property uchar red\n')
+            f.write('property uchar green\n')
+            f.write('property uchar blue\n')
+        f.write('end_header\n')
+        
+        # Write points and colors
+        for i in range(num_points):
+            f.write(f'{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f}')
+            if colors is not None:
+                f.write(f' {int(colors[i, 0])} {int(colors[i, 1])} {int(colors[i, 2])}')
+            f.write('\n')
+
+
+def downsample_pointcloud_voxel(points: np.ndarray, colors: np.ndarray = None, voxel_size: float = 0.01):
+    """
+    Downsample point cloud using voxel grid filtering.
+    
+    Args:
+        points: Nx3 array of 3D points
+        colors: Optional Nx3 array of RGB colors (0-255)
+        voxel_size: Size of each voxel for downsampling
+    
+    Returns:
+        Downsampled points and colors (if provided)
+    """
+    if len(points) == 0:
+        return points, colors
+    
+    # Compute voxel indices for each point
+    voxel_indices = np.floor(points / voxel_size).astype(np.int64)
+    
+    # Use lexsort to sort by voxel indices, then find unique voxels
+    # This is more efficient and avoids hash collisions
+    sorted_indices = np.lexsort((voxel_indices[:, 2], voxel_indices[:, 1], voxel_indices[:, 0]))
+    sorted_voxels = voxel_indices[sorted_indices]
+    
+    # Find where voxel indices change (unique voxels)
+    diff = np.any(sorted_voxels[1:] != sorted_voxels[:-1], axis=1)
+    unique_mask = np.concatenate(([True], diff))
+    
+    # Get indices of first point in each unique voxel
+    downsampled_indices = sorted_indices[unique_mask]
+    downsampled_points = points[downsampled_indices]
+    
+    if colors is not None:
+        downsampled_colors = colors[downsampled_indices]
+    else:
+        downsampled_colors = None
+    
+    return downsampled_points, downsampled_colors
+
+
 
 def find_correspondence_by_pdcnet(pdcnet_model, image_ref: np.ndarray, mask_ref: np.ndarray, image_query: np.ndarray, mask_query: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     height, width = image_query.shape[:2]
@@ -160,7 +232,9 @@ def find_correspondence_by_pdcnet(pdcnet_model, image_ref: np.ndarray, mask_ref:
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path')
 @click.option('--output', 'output_path', type=str, default='video_output', help='Output directory')
 @click.option('--fps', type=int, default=24, help='Output video FPS')
-def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int):
+@click.option('--voxel-size', 'voxel_size', type=float, default=0.005, help='Voxel size for point cloud downsampling (0 to disable)')
+@click.option('--image_based', is_flag=True, help='Use image-based inference.')
+def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, image_based: bool):
     if Path(video_path).is_file():
         image_frames = read_frames_from_video(video_path, start, end, skip, target_size=input_size)
     elif Path(video_path).is_dir():
@@ -205,7 +279,7 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             # Inference with MoGe
             curr_image = image_frames[i_curr]
             curr_image_tensor = torch.tensor(curr_image.astype(np.float32) / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
-            output = moge_model.infer(curr_image_tensor, fov_x=fov_x, prev_state=prev_state)
+            output = moge_model.infer(curr_image_tensor, fov_x=fov_x, prev_state=prev_state, image_based=image_based)
             curr_points, curr_mask, curr_intrinsics, curr_depth = output['points'].cpu().numpy(), output['mask'].cpu().numpy(), output['intrinsics'].cpu().numpy(), output['depth'].cpu().numpy()
             prev_state = output['prev_state']
             curr_mask &= ~utils3d.np.depth_map_edge(curr_points[:, :, 2], rtol=0.05, mask=curr_mask)
@@ -248,6 +322,39 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             pose_frames.append((pose, curr_intrinsics.astype(np.float32)))
             canonical_points_frames.append(curr_points_canonical.astype(np.float32))
             inlier_mask_frames.append(inlier_mask)
+
+    # Combine all point clouds and save to PLY
+    print('Combining point clouds from all frames...')
+    combined_points = []
+    combined_colors = []
+    for idx in tqdm(range(0, num_frames, 25), desc='Combining point clouds'):
+        mask = prediction_frames[idx][1]
+        points = canonical_points_frames[idx][mask]
+        colors = image_frames[idx][mask]
+        # Ensure colors are in 0-255 uint8 format
+        if colors.dtype != np.uint8:
+            if colors.max() <= 1.0:
+                colors = (colors * 255).astype(np.uint8)
+            else:
+                colors = colors.astype(np.uint8)
+        combined_points.append(points)
+        combined_colors.append(colors)
+    
+    combined_points = np.concatenate(combined_points, axis=0)
+    combined_colors = np.concatenate(combined_colors, axis=0)
+    
+    # Downsample point cloud if voxel_size > 0
+    if voxel_size > 0:
+        print(f'Downsampling point cloud with voxel size {voxel_size}...')
+        original_count = combined_points.shape[0]
+        combined_points, combined_colors = downsample_pointcloud_voxel(combined_points, combined_colors, voxel_size=voxel_size)
+        print(f'Downsampled from {original_count} to {combined_points.shape[0]} points ({100 * combined_points.shape[0] / original_count:.1f}%)')
+    
+    # Save combined point cloud to PLY
+    ply_output_path = Path(output_path, video_name, 'combined_pointcloud.ply')
+    print(f'Saving combined point cloud to {ply_output_path}...')
+    write_ply(ply_output_path, combined_points, combined_colors)
+    print(f'Combined point cloud saved: {combined_points.shape[0]} points')
 
     # Render
     if camera_path is not None:
