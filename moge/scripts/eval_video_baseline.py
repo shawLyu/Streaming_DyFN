@@ -121,8 +121,8 @@ def main(
             print(f"Warning: Dataset path {dataset_path} does not exist, skipping...")
             continue
 
-        video_path_list = glob.glob(str(dataset_path / "*.mp4"))
-        gt_depth_path_list = glob.glob(str(dataset_path / "*.npz"))
+        video_path_list = sorted(glob.glob(str(dataset_path / "*.mp4")))
+        gt_depth_path_list = sorted(glob.glob(str(dataset_path / "*.npz")))
 
         print(f"==> Found {len(video_path_list)} videos and {len(gt_depth_path_list)} gt depths for {dataset}")
 
