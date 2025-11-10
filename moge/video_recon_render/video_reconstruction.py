@@ -18,6 +18,7 @@ import torch
 import cv2
 import matplotlib.pyplot as plt
 from scipy.interpolate import CubicSpline
+import open3d as o3d
 
 from moge.model.v1 import MoGeModel  
 # from moge.utils.io import write_points
@@ -124,40 +125,32 @@ def write_video(path: Union[str, os.PathLike], frames: List[np.ndarray], fps: in
 
 def write_ply(path: Union[str, os.PathLike], points: np.ndarray, colors: np.ndarray = None):
     """
-    Write point cloud to PLY file format.
+    Write point cloud to PLY file format using open3d.
     
     Args:
         path: Output PLY file path
         points: Nx3 array of 3D points
         colors: Optional Nx3 array of RGB colors (0-255)
     """
-    num_points = points.shape[0]
+    # Create open3d point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
     
-    with open(path, 'w') as f:
-        # Write PLY header
-        f.write('ply\n')
-        f.write('format ascii 1.0\n')
-        f.write(f'element vertex {num_points}\n')
-        f.write('property float x\n')
-        f.write('property float y\n')
-        f.write('property float z\n')
-        if colors is not None:
-            f.write('property uchar red\n')
-            f.write('property uchar green\n')
-            f.write('property uchar blue\n')
-        f.write('end_header\n')
-        
-        # Write points and colors
-        for i in range(num_points):
-            f.write(f'{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f}')
-            if colors is not None:
-                f.write(f' {int(colors[i, 0])} {int(colors[i, 1])} {int(colors[i, 2])}')
-            f.write('\n')
+    if colors is not None:
+        # Ensure colors are in 0-1 range for open3d
+        if colors.max() > 1.0:
+            colors_normalized = colors.astype(np.float64) / 255.0
+        else:
+            colors_normalized = colors.astype(np.float64)
+        pcd.colors = o3d.utility.Vector3dVector(colors_normalized)
+    
+    # Write PLY file
+    o3d.io.write_point_cloud(str(path), pcd)
 
 
 def downsample_pointcloud_voxel(points: np.ndarray, colors: np.ndarray = None, voxel_size: float = 0.01):
     """
-    Downsample point cloud using voxel grid filtering.
+    Downsample point cloud using voxel grid filtering with open3d.
     
     Args:
         points: Nx3 array of 3D points
@@ -170,24 +163,31 @@ def downsample_pointcloud_voxel(points: np.ndarray, colors: np.ndarray = None, v
     if len(points) == 0:
         return points, colors
     
-    # Compute voxel indices for each point
-    voxel_indices = np.floor(points / voxel_size).astype(np.int64)
-    
-    # Use lexsort to sort by voxel indices, then find unique voxels
-    # This is more efficient and avoids hash collisions
-    sorted_indices = np.lexsort((voxel_indices[:, 2], voxel_indices[:, 1], voxel_indices[:, 0]))
-    sorted_voxels = voxel_indices[sorted_indices]
-    
-    # Find where voxel indices change (unique voxels)
-    diff = np.any(sorted_voxels[1:] != sorted_voxels[:-1], axis=1)
-    unique_mask = np.concatenate(([True], diff))
-    
-    # Get indices of first point in each unique voxel
-    downsampled_indices = sorted_indices[unique_mask]
-    downsampled_points = points[downsampled_indices]
+    # Create open3d point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
     
     if colors is not None:
-        downsampled_colors = colors[downsampled_indices]
+        # Ensure colors are in 0-1 range for open3d
+        if colors.max() > 1.0:
+            colors_normalized = colors.astype(np.float64) / 255.0
+        else:
+            colors_normalized = colors.astype(np.float64)
+        pcd.colors = o3d.utility.Vector3dVector(colors_normalized)
+    
+    # Downsample using open3d
+    downsampled_pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+    
+    # Convert back to numpy arrays
+    downsampled_points = np.asarray(downsampled_pcd.points).astype(np.float32)
+    
+    if colors is not None:
+        downsampled_colors = np.asarray(downsampled_pcd.colors)
+        # Convert colors back to 0-255 range if original was in that range
+        if colors.max() > 1.0:
+            downsampled_colors = (downsampled_colors * 255).astype(np.uint8)
+        else:
+            downsampled_colors = downsampled_colors.astype(np.float32)
     else:
         downsampled_colors = None
     
@@ -232,7 +232,7 @@ def find_correspondence_by_pdcnet(pdcnet_model, image_ref: np.ndarray, mask_ref:
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path')
 @click.option('--output', 'output_path', type=str, default='video_output', help='Output directory')
 @click.option('--fps', type=int, default=24, help='Output video FPS')
-@click.option('--voxel-size', 'voxel_size', type=float, default=0.005, help='Voxel size for point cloud downsampling (0 to disable)')
+@click.option('--voxel-size', 'voxel_size', type=float, default=0.002, help='Voxel size for point cloud downsampling (0 to disable)')
 @click.option('--image_based', is_flag=True, help='Use image-based inference.')
 def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, image_based: bool):
     if Path(video_path).is_file():
@@ -327,7 +327,12 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
     print('Combining point clouds from all frames...')
     combined_points = []
     combined_colors = []
-    for idx in tqdm(range(0, num_frames, 25), desc='Combining point clouds'):
+    
+    # Create directory for separate point clouds
+    separate_pc_dir = Path(output_path, video_name, 'pointclouds')
+    separate_pc_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx in tqdm(range(num_frames), desc='Processing point clouds'):
         mask = prediction_frames[idx][1]
         points = canonical_points_frames[idx][mask]
         colors = image_frames[idx][mask]
@@ -337,8 +342,15 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
                 colors = (colors * 255).astype(np.uint8)
             else:
                 colors = colors.astype(np.uint8)
-        combined_points.append(points)
-        combined_colors.append(colors)
+        
+        # Save individual point cloud
+        frame_ply_path = separate_pc_dir / f'frame_{idx:05d}.ply'
+        write_ply(frame_ply_path, points, colors)
+        
+        # Add to combined point cloud (every 15th frame)
+        if idx % 15 == 0:
+            combined_points.append(points)
+            combined_colors.append(colors)
     
     combined_points = np.concatenate(combined_points, axis=0)
     combined_colors = np.concatenate(combined_colors, axis=0)
@@ -350,12 +362,11 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
         combined_points, combined_colors = downsample_pointcloud_voxel(combined_points, combined_colors, voxel_size=voxel_size)
         print(f'Downsampled from {original_count} to {combined_points.shape[0]} points ({100 * combined_points.shape[0] / original_count:.1f}%)')
     
-    # Save combined point cloud to PLY
+    # Save combined point cloud with camera frustums to PLY
     ply_output_path = Path(output_path, video_name, 'combined_pointcloud.ply')
     print(f'Saving combined point cloud to {ply_output_path}...')
     write_ply(ply_output_path, combined_points, combined_colors)
-    print(f'Combined point cloud saved: {combined_points.shape[0]} points')
-
+    
     # Render
     if camera_path is not None:
         render_height, render_width = 768, 1024
