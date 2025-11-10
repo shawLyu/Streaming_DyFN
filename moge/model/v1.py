@@ -512,7 +512,10 @@ class MoGeModel(nn.Module):
 
         # If projection constraint is forced, recompute the point map using the actual depth map
         if force_projection:
-            points = utils3d.pt.depth_map_to_point_map(depth, intrinsics=intrinsics)
+            try:
+                points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
+            except:
+                points = utils3d.pt.depth_map_to_point_map(depth, intrinsics=intrinsics)
         else:
             points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
 
@@ -626,7 +629,10 @@ class MoGeModel(nn.Module):
 
         # If projection constraint is forced, recompute the point map using the actual depth map
         if force_projection:
-            points = utils3d.pt.depth_map_to_point_map(depth, intrinsics=intrinsics)
+            try:
+                points = utils3d.torch.depth_to_points(depth, intrinsics=intrinsics)
+            except:
+                points = utils3d.pt.depth_map_to_point_map(depth, intrinsics=intrinsics)
         else:
             points = points + torch.stack([torch.zeros_like(shift), torch.zeros_like(shift), shift], dim=-1)[..., None, None, :]
 
