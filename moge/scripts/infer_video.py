@@ -43,18 +43,52 @@ def read_video_frames(video_path, target_fps, max_res):
     frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
     return frames, fps
 
-def compute_svd_raw(feature):
-    """Compute top-3 singular vectors of feature map (not normalized)."""
+def compute_svd_raw(feature, prev_uh=None):
+    """Compute top-3 singular vectors of feature map (not normalized).
+    
+    This function ensures that left singular vectors maintain consistent direction
+    across frames by aligning them with the previous frame's vectors.
+    
+    Args:
+        feature: Input feature map of shape (C, H, W)
+        prev_uh: Previous frame's left singular vectors of shape (C, K) where K = min(C, H*W),
+                 or None for first frame
+    
+    Returns:
+        svd_components: Stacked components of shape (H, W, 3)
+        uh: Left singular vectors of shape (C, K) for next frame alignment, where K = min(C, H*W)
+    """
     c, h, w = feature.shape
     feature_2d = feature.reshape(c, -1)
 
     uh, _, vh = np.linalg.svd(feature_2d, full_matrices=False)
-    if uh[0, 0] < 0:
-        vh[0] = -vh[0]
-    if uh[0, 1] < 0:
-        vh[1] = -vh[1]
-    comps = [vh[0].reshape(h, w), vh[1].reshape(h, w), vh[2].reshape(h, w)]  # raw values
-    return np.stack(comps, axis=-1)  # (H, W, 3)
+    
+    # Align left singular vectors to maintain consistent direction
+    if prev_uh is not None:
+        # For each singular vector, check dot product with previous frame
+        # If negative, flip both left and right vectors to maintain SVD property
+        num_vectors = min(3, min(uh.shape[1], prev_uh.shape[1]))
+        for i in range(num_vectors):
+            dot_product = np.dot(uh[:, i], prev_uh[:, i])
+            if dot_product < 0:
+                uh[:, i] = -uh[:, i]
+                vh[i] = -vh[i]
+    else:
+        # For the first frame, ensure first element of first vector is positive
+        if uh.shape[1] > 0 and uh[0, 0] < 0:
+            uh[:, 0] = -uh[:, 0]
+            vh[0] = -vh[0]
+        if uh.shape[1] > 1 and uh[0, 1] < 0:
+            uh[:, 1] = -uh[:, 1]
+            vh[1] = -vh[1]
+    
+    # Extract top 3 components, pad with zeros if needed
+    num_comps = min(3, vh.shape[0])
+    comps = [vh[i].reshape(h, w) for i in range(num_comps)]
+    # Pad to 3 components if needed
+    while len(comps) < 3:
+        comps.append(np.zeros((h, w)))
+    return np.stack(comps, axis=-1), uh  # (H, W, 3), (C, K) where K = min(C, H*W)
 
 def normalize_svd(svd_img, vmin, vmax):
     return (svd_img - vmin) / (vmax - vmin + 1e-8)
@@ -189,9 +223,11 @@ def main(
     if vis_feature:
         print("==> visualizing feature maps")
         frames_np = (frames * 255).astype(np.uint8)
+        prev_uh_before = None
+        prev_uh_after = None
         for feat_before, feat_after in zip(feature_before_temporal_attention, feature_after_temporal_attention):
-            feat_before_svd = compute_svd_raw(feat_before)
-            feat_after_svd = compute_svd_raw(feat_after)
+            feat_before_svd, prev_uh_before = compute_svd_raw(feat_before, prev_uh_before)
+            feat_after_svd, prev_uh_after = compute_svd_raw(feat_after, prev_uh_after)
             feats_before_svd.append(feat_before_svd)
             feats_after_svd.append(feat_after_svd)
         
