@@ -593,6 +593,7 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
         
         # Create valid mask
         valid_mask_i = (depth_gt > depth_min) & (depth_gt < depth_max) & (d_est_resized > 1e-3)
+        valid_mask_i &= utils3d.numpy.depth_edge(d_est_resized, rtol=0.03)
         
         if np.sum(valid_mask_i) > 100:
             all_pred_depths_masked.append(d_est_resized[valid_mask_i].reshape(-1, 1))

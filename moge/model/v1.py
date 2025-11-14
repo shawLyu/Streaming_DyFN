@@ -596,7 +596,7 @@ class MoGeModel(nn.Module):
 
         with torch.autocast(device_type=image.device.type, dtype=torch.float16, enabled=use_fp16):
             features = self.backbone.get_intermediate_layers(image, self.intermediate_layers, return_class_token=True)
-            output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image, prev_state, inference_mode=True, image_based=image_based)
+            output, prev_state, features_before_stabilizer, features_after_stabilizer = self.head.forward_recurrent(features, image, prev_state=prev_state, inference_mode=True, image_based=image_based)
 
         # # points, mask, scale, shift = output['points'], output['mask'], output['metric_scale'], output['shift']
         # points, mask, scale, shift = output['points'], output['mask'], output['metric_scale'], None

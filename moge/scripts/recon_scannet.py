@@ -12,6 +12,7 @@ from tqdm import tqdm
 import open3d as o3d
 import torch
 import warnings
+import utils3d
 
 from moge.model.v1 import MoGeModel
 from moge.video_benchmark.eval.metric import *
@@ -523,6 +524,7 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
             break
         
         d_est = depth_est_all[i]
+        mask_est = mask_est_all[i]
         
         # Load GT depth (keep original size)
         depth_gt = cv2.imread(str(depth_file), cv2.IMREAD_UNCHANGED)
@@ -534,11 +536,14 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
         # Resize predicted depth to match GT depth size
         if d_est.shape != (h_gt, w_gt):
             d_est_resized = cv2.resize(d_est, (w_gt, h_gt), interpolation=cv2.INTER_LINEAR)
+            mask_est_resized = cv2.resize(mask_est.astype(np.uint8), (w_gt, h_gt), interpolation=cv2.INTER_NEAREST).astype(bool)
         else:
             d_est_resized = d_est
+            mask_est_resized = mask_est
         
         # Create valid mask
         valid_mask_i = (depth_gt > depth_min) & (depth_gt < depth_max) & (d_est_resized > 1e-3)
+        valid_mask_i &= utils3d.numpy.depth_edge(d_est_resized, rtol=0.03, mask=mask_est_resized)
         
         if np.sum(valid_mask_i) > 100:
             all_pred_depths_masked.append(d_est_resized[valid_mask_i].reshape(-1, 1))
