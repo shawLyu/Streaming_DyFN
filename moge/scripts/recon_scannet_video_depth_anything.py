@@ -14,8 +14,7 @@ import torch
 import torch.nn.functional as F
 import warnings
 
-from baselines.flashdepth.model import FlashDepth
-from omegaconf import DictConfig
+from baselines.video_depth_anything.video_depth import VideoDepthAnything
 from moge.video_benchmark.eval.metric import *
 import moge.video_benchmark.eval.metric as metric
 import utils3d
@@ -318,7 +317,7 @@ def save_point_cloud(points_list, colors_list, output_path, voxel_size=0.02):
 @click.option('--use_model_depth', is_flag=True,
               help='Use model predicted depth and generate aligned point clouds')
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, required=True,
-              help='Path to FlashDepth pretrained model checkpoint')
+              help='Path to VideoDepthAnything pretrained model checkpoint')
 @click.option('--max_res', type=int, default=1024,
               help='Maximum resolution dimension for model inference')
 @click.option('--enable_eval', is_flag=True,
@@ -327,7 +326,7 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
          use_model_depth, pretrained_model_name_or_path, max_res, enable_eval):
     """
     Reconstruct a ScanNet scene by combining point clouds from color, depth, intrinsic, and pose data.
-    Always generates GT reconstruction. If --use_model_depth is set, also generates per_frame_align and sequential_align reconstructions using FlashDepth.
+    Always generates GT reconstruction. If --use_model_depth is set, also generates per_frame_align and sequential_align reconstructions using VideoDepthAnything.
     """
     scene_dir = Path(scene_dir)
     
@@ -445,7 +444,7 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
         all_colors_gt.append(colors)
     
     if all_world_points_gt:
-        gt_output_path = output_dir / "gt_flashdepth.ply"
+        gt_output_path = output_dir / "gt_vda.ply"
         save_point_cloud(all_world_points_gt, all_colors_gt, gt_output_path, voxel_size)
     
     # ========== Step 2: If using model, generate predicted depth and aligned reconstructions ==========
@@ -454,113 +453,62 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
         return
     
     print("\n" + "="*60)
-    print("Step 2: Running FlashDepth model inference")
+    print("Step 2: Running VideoDepthAnything model inference")
     print("="*60)
     
     # Load model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"==> Loading FlashDepth model: {pretrained_model_name_or_path}")
+    print(f"==> Loading VideoDepthAnything model: {pretrained_model_name_or_path}")
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     
-    # Hardcoded configs (following eval_video.py)
-    hybrid_configs = {
-        'use_hybrid': False, 
-        'teacher_model_path': None, 
-        'teacher_resolution': 490, 
-        'layers_to_skip': [1, 2, 3], 
-        'num_blocks': 4, 
-        'mlp_expand': 2, 
-        'num_heads': 2
-    }
+    # Model configs (following eval_video_long_vda.py)
     model_configs = {
-        'vit_size': 'vitl',
-        'patch_size': 14,
-        'attn_class': 'MemEffAttention',
-        'use_mamba': True, 
-        'mamba_type': 'add', 
-        'num_mamba_layers': 4, 
-        'downsample_mamba': [0.1], 
-        'mamba_pos_embed': None, 
-        'mamba_in_dpt_layer': [3], 
-        'mamba_d_conv': 4, 
-        'mamba_d_state': 256, 
-        'use_hydra': False, 
-        'use_transformer_rnn': False, 
-        'use_xlstm': False,
-    }
-
-    eval_args = {
-        'save_depth_npy': False,
-        'save_vis_map': False,
-        'out_video': False,
-        'out_mp4': False,
-        'use_mamba': True,
-        'resolution': 518,
-        'print_time': True,
-        'loss_type': 'l1',
-        'use_all_frames': True,
-        'use_metrics': False,
-        'dummy_timing': False
+        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     }
     
-    model = FlashDepth(**dict( 
-        batch_size=1, 
-        hybrid_configs=DictConfig(hybrid_configs),
-        training=False,
-        **DictConfig(model_configs),
-    )).to(device)
-    model.load_state_dict(torch.load(pretrained_model_name_or_path, weights_only=True)["model"])
-    model.eval()
+    model = VideoDepthAnything(**model_configs['vitl'], metric="video_depth_anything")
+    model.load_state_dict(torch.load(pretrained_model_name_or_path, map_location='cpu'), strict=True)
+    model = model.to(device).eval()
     print(f"==> Model loaded on {device}")
     
     # Load all color images and prepare for inference
     print("==> Loading all color images...")
-    color_images = []
-    original_sizes = []
+    frames = []
     for color_file, _, _, _ in frame_names:
         color = cv2.imread(str(color_file))
         if color is not None:
             color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
             # Crop black borders (ScanNet format)
             color = color[8:-8, 11:-11, :]
-            original_sizes.append(color.shape[:2])  # Store (h, w)
             h, w = color.shape[:2]
             
-            # Resize to be divisible by patch_size (14) and within max_res
-            patch_size = 14
-            height = round(h / patch_size) * patch_size
-            width = round(w / patch_size) * patch_size
-            
-            if max(height, width) > max_res:
+            # Resize if needed to fit within max_res
+            if max(h, w) > max_res:
                 scale = max_res / max(h, w)
-                height = round(h * scale / patch_size) * patch_size
-                width = round(w * scale / patch_size) * patch_size
+                new_h = round(h * scale)
+                new_w = round(w * scale)
+                color = cv2.resize(color, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             
-            if (height, width) != (h, w):
-                color = cv2.resize(color, (width, height), interpolation=cv2.INTER_LINEAR)
-            
-            color_images.append(color.astype(np.float32) / 255.0)
+            frames.append(color)
     
-    if not color_images:
+    if not frames:
         print("Error: No valid color images found")
         return
     
+    # Stack frames into numpy array (T, H, W, 3)
+    frames = np.stack(frames, axis=0)
+    
     # Run model inference
-    print(f"==> Running FlashDepth inference...")
+    print(f"==> Running VideoDepthAnything inference...")
     with torch.no_grad():
-        image_tensor = torch.from_numpy(np.stack(color_images)).permute(0, 3, 1, 2).to(device)
-        # Ensure dimensions are divisible by patch_size
-        if image_tensor.shape[-2] // 14 != image_tensor.shape[-1] // 14:
-            h_new = image_tensor.shape[-2] // 14 * 14
-            w_new = image_tensor.shape[-1] // 14 * 14
-            image_tensor = F.interpolate(image_tensor, (h_new, w_new), mode='bilinear', align_corners=False)
-        
-        output = model(image_tensor.unsqueeze(0), **eval_args)
-        depth_est_all = output['depth'].cpu().numpy()  # (T, H, W)
-        
-        # Remove batch dimension if present
-        if depth_est_all.ndim == 4:
-            depth_est_all = depth_est_all.squeeze()  # Remove channel dimension if present
+        depths, fps = model.infer_video_depth(frames, target_fps=-1, input_size=518, device=device.type, fp32=True)
+        # Convert to numpy if needed
+        if isinstance(depths, torch.Tensor):
+            depth_est_all = depths.cpu().numpy()  # (T, H, W)
+        else:
+            depth_est_all = depths  # Already numpy array
     
     print("==> Model inference complete")
     
@@ -670,7 +618,7 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
             continue
     
     if all_world_points_perframe:
-        perframe_output_path = output_dir / "per_frame_align_flashdepth.ply"
+        perframe_output_path = output_dir / "per_frame_align_vda.ply"
         save_point_cloud(all_world_points_perframe, all_colors_perframe, perframe_output_path, voxel_size)
     
     # ========== Step 5: Reconstruct sequence-aligned point cloud ==========
@@ -728,7 +676,7 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
             continue
     
     if all_world_points_seq:
-        seq_output_path = output_dir / "sequential_align_flashdepth.ply"
+        seq_output_path = output_dir / "sequential_align_vda.ply"
         save_point_cloud(all_world_points_seq, all_colors_seq, seq_output_path, voxel_size)
     
     # ========== Step 6: Evaluation metrics (if enabled) ==========
@@ -801,7 +749,7 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
         
         # Save evaluation results
         if eval_results:
-            eval_output_path = output_dir / "evaluation_results_flashdepth.json"
+            eval_output_path = output_dir / "evaluation_results_vda.json"
             with open(eval_output_path, 'w') as f:
                 json.dump(eval_results, f, indent=2)
             print(f"\n==> Evaluation results saved to: {eval_output_path}")
