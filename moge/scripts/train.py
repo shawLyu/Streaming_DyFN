@@ -322,10 +322,10 @@ def main(
                     gt_shift = None
                     scale_list, shift_list = [], []
                     for b in range(current_batch_size):
-                        if label_type[b*sequence_length] == 'invalid':
+                        if "invalid" in label_type[b*sequence_length: (b+1)*sequence_length]:
                             scale_list.append(None)
                             shift_list.append(None)
-                            continue
+                            continue    
                         align_method = config['loss'].get('align_method', 'scale_from_first_frame')
                         if align_method == 'scale_from_first_frame':
                             # This alignment method is to use the first frame to compute the scale and shift
@@ -406,6 +406,9 @@ def main(
                         loss_list.append(0.1 * loss_temporal)
                         records.append({'loss_temporal': loss_temporal.item()})
 
+                    if len(loss_list) == 0:
+                        optimizer.zero_grad()
+                        continue
                     loss = sum(loss_list) / len(loss_list)
                     
                     # Backward & update
@@ -506,7 +509,7 @@ def main(
                         image, gt_depth, gt_mask, gt_intrinsics = image.to(device), gt_depth.to(device), gt_mask.to(device), gt_intrinsics.to(device)
                         
                         image = image.reshape(batch_size_forward, sequence_length, *image.shape[1:]) # (B, S, 3, H, W)
-                        output = unwrapped_model.infer(image)
+                        output = unwrapped_model.infer_train(image)
                         image = image.reshape(-1, *image.shape[2:])
                         pred_points, pred_depth, pred_mask = output['points'].cpu().numpy(), output['depth'].cpu().numpy(), output['mask'].cpu().numpy()
                         image = image.cpu().numpy()

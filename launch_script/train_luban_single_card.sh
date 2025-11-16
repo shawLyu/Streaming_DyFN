@@ -7,13 +7,15 @@ CFG=${1:-"configs/train/video_finetune_local_tartanair.json"}
 
 WORKSPACE=${2:-"workspace/video_finetune_luban"}
 
+BATCH_SIZE_FORWARD=${3:-4}
+
 accelerate launch \
     --num_processes 8 \
     moge/scripts/train.py \
     --config $CFG \
     --workspace $WORKSPACE \
     --gradient_accumulation_steps 1 \
-    --batch_size_forward 4 \
+    --batch_size_forward $BATCH_SIZE_FORWARD \
     --checkpoint pretrained_moge/pretrained_moge.pt \
     --enable_gradient_checkpointing False \
     --vis_every 500 \
