@@ -392,14 +392,28 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
         Path(output_path, video_name, 'video').mkdir(exist_ok=True)
         write_video(Path(output_path, video_name, 'video', 'input.mp4'), image_frames, fps=fps)
 
+        # Helper function to generate color for each frame index
+        def get_camera_color(frame_idx, total_frames, alpha=0.8):
+            """
+            Generate a color for camera frustum based on frame index.
+            Uses HSV color space to generate distinct colors.
+            """
+            # Map frame index to hue (0-360 degrees in HSV)
+            hue = (frame_idx / max(total_frames - 1, 1)) * 300  # Use 0-300 range for better colors
+            # Use high saturation and value for vibrant colors
+            saturation = 200 + int(55 * alpha)  # 200-255
+            value = 200 + int(55 * alpha)  # 200-255
+            
+            # Convert HSV to BGR (OpenCV uses BGR, and HSV hue is 0-180)
+            hsv_color = np.uint8([[[int(hue / 2), saturation, value]]])  # OpenCV uses 0-180 for hue
+            bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0, 0]
+            return tuple(int(c) for c in bgr_color)
+        
         # Render per-frame point cloud
         render_frames = []
         for idx in trange(num_frames, desc='Render'):
             _, mask = prediction_frames[idx]
             render_view = utils3d.np.view_look_at(eye=eye_traj(idx), look_at=look_at_traj(idx), up=up).astype(np.float32)
-            
-            pose, intrinsics = pose_frames[idx]
-            extrinsics = np.linalg.inv(pose)
 
             # Render point cloud
             render_output = utils3d.np.rasterize_point_cloud(
@@ -412,19 +426,6 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
                 projection=render_projection,
                 return_depth=True
             )
-            
-            # Render camera frustum by projecting vertices to 2D and drawing with OpenCV
-            # This avoids depth test issues with rasterize_lines
-            camera_vertices, camera_edges, _ = utils3d.np.create_camera_frustum_mesh(extrinsics, intrinsics, 0.1)
-            # Transform vertices to clip space
-            vertices_homogeneous = np.concatenate([camera_vertices, np.ones((camera_vertices.shape[0], 1), dtype=np.float32)], axis=1)
-            vertices_clip = (render_projection @ render_view @ vertices_homogeneous.T).T
-            # Perspective divide
-            vertices_ndc = vertices_clip[:, :3] / (vertices_clip[:, 3:4] + 1e-8)
-            # Convert to screen coordinates
-            vertices_screen = np.zeros((camera_vertices.shape[0], 2), dtype=np.int32)
-            vertices_screen[:, 0] = ((vertices_ndc[:, 0] + 1) * 0.5 * render_width).astype(np.int32)
-            vertices_screen[:, 1] = ((1 - vertices_ndc[:, 1]) * 0.5 * render_height).astype(np.int32)
             
             # Prepare point cloud image
             point_cloud_image = render_output['image'].copy()
@@ -439,33 +440,58 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             # First composite point cloud (only where mask is True)
             render_image = np.where(render_output['mask'][:, :, None], point_cloud_image, render_image).astype(np.uint8)
             
-            # Create a separate image for frustum (draw on white background first)
+            # Create a separate image for all frustums (draw on white background first)
             frustum_image = np.ones((render_height, render_width, 3), dtype=np.uint8) * 255
             frustum_image_bgr = cv2.cvtColor(frustum_image, cv2.COLOR_RGB2BGR)
             
-            # Draw all frustum edges on the separate image
-            for edge in camera_edges:
-                v0_idx, v1_idx = edge[0], edge[1]
-                w0, w1 = vertices_clip[v0_idx, 3], vertices_clip[v1_idx, 3]
-                if w0 > 0 and w1 > 0:
-                    ndc0 = vertices_ndc[v0_idx]
-                    ndc1 = vertices_ndc[v1_idx]
-                    if not ((ndc0[0] < -1 and ndc1[0] < -1) or (ndc0[0] > 1 and ndc1[0] > 1) or
-                            (ndc0[1] < -1 and ndc1[1] < -1) or (ndc0[1] > 1 and ndc1[1] > 1)):
-                        pt0 = (int(np.clip(vertices_screen[v0_idx, 0], 0, render_width - 1)), 
-                               int(np.clip(vertices_screen[v0_idx, 1], 0, render_height - 1)))
-                        pt1 = (int(np.clip(vertices_screen[v1_idx, 0], 0, render_width - 1)), 
-                               int(np.clip(vertices_screen[v1_idx, 1], 0, render_height - 1)))
-                        cv2.line(frustum_image_bgr, pt0, pt1, (0, 255, 0), 2)
+            # Draw all historical camera frustums (from frame 0 to current frame)
+            for hist_idx in range(idx + 1):
+                hist_pose, hist_intrinsics = pose_frames[hist_idx]
+                hist_extrinsics = np.linalg.inv(hist_pose)
+                
+                # Get color for this historical camera
+                camera_color_bgr = get_camera_color(hist_idx, num_frames)
+                
+                # Create camera frustum mesh
+                camera_vertices, camera_edges, _ = utils3d.np.create_camera_frustum_mesh(hist_extrinsics, hist_intrinsics, 0.1)
+                
+                # Transform vertices to clip space
+                vertices_homogeneous = np.concatenate([camera_vertices, np.ones((camera_vertices.shape[0], 1), dtype=np.float32)], axis=1)
+                vertices_clip = (render_projection @ render_view @ vertices_homogeneous.T).T
+                
+                # Perspective divide
+                vertices_ndc = vertices_clip[:, :3] / (vertices_clip[:, 3:4] + 1e-8)
+                
+                # Convert to screen coordinates
+                vertices_screen = np.zeros((camera_vertices.shape[0], 2), dtype=np.int32)
+                vertices_screen[:, 0] = ((vertices_ndc[:, 0] + 1) * 0.5 * render_width).astype(np.int32)
+                vertices_screen[:, 1] = ((1 - vertices_ndc[:, 1]) * 0.5 * render_height).astype(np.int32)
+                
+                # Draw all frustum edges with the assigned color
+                for edge in camera_edges:
+                    v0_idx, v1_idx = edge[0], edge[1]
+                    w0, w1 = vertices_clip[v0_idx, 3], vertices_clip[v1_idx, 3]
+                    if w0 > 0 and w1 > 0:
+                        ndc0 = vertices_ndc[v0_idx]
+                        ndc1 = vertices_ndc[v1_idx]
+                        if not ((ndc0[0] < -1 and ndc1[0] < -1) or (ndc0[0] > 1 and ndc1[0] > 1) or
+                                (ndc0[1] < -1 and ndc1[1] < -1) or (ndc0[1] > 1 and ndc1[1] > 1)):
+                            pt0 = (int(np.clip(vertices_screen[v0_idx, 0], 0, render_width - 1)), 
+                                   int(np.clip(vertices_screen[v0_idx, 1], 0, render_height - 1)))
+                            pt1 = (int(np.clip(vertices_screen[v1_idx, 0], 0, render_width - 1)), 
+                                   int(np.clip(vertices_screen[v1_idx, 1], 0, render_height - 1)))
+                            # Use different line width for current frame (thicker) vs historical frames
+                            line_width = 3 if hist_idx == idx else 2
+                            cv2.line(frustum_image_bgr, pt0, pt1, camera_color_bgr, line_width)
             
             # Convert frustum image back to RGB
             frustum_image = cv2.cvtColor(frustum_image_bgr, cv2.COLOR_BGR2RGB)
             
-            # Create mask for frustum pixels (green pixels, not white background)
-            frustum_mask = np.all(frustum_image == [0, 255, 0], axis=2)
+            # Create mask for frustum pixels (any non-white pixels)
+            frustum_mask = ~np.all(frustum_image == 255, axis=2)
             
             # Composite: overlay frustum on top of point cloud
-            # Where frustum exists, use frustum (green), otherwise use point cloud/background
+            # Where frustum exists, use frustum, otherwise use point cloud/background
             render_image = np.where(
                 frustum_mask[:, :, None], 
                 frustum_image, 
