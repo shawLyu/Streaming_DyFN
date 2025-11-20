@@ -323,55 +323,56 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             canonical_points_frames.append(curr_points_canonical.astype(np.float32))
             inlier_mask_frames.append(inlier_mask)
 
-    # Combine all point clouds and save to PLY
-    print('Combining point clouds from all frames...')
-    combined_points = []
-    combined_colors = []
-    
-    # Create directory for separate point clouds
-    separate_pc_dir = Path(output_path, video_name, 'pointclouds')
-    separate_pc_dir.mkdir(parents=True, exist_ok=True)
+    if not use_existing_results:
+        # Combine all point clouds and save to PLY
+        print('Combining point clouds from all frames...')
+        combined_points = []
+        combined_colors = []
+        
+        # Create directory for separate point clouds
+        separate_pc_dir = Path(output_path, video_name, 'pointclouds')
+        separate_pc_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx in tqdm(range(num_frames), desc='Processing point clouds'):
-        mask = prediction_frames[idx][1]
-        points = canonical_points_frames[idx][mask]
-        colors = image_frames[idx][mask]
-        # Ensure colors are in 0-255 uint8 format
-        if colors.dtype != np.uint8:
-            if colors.max() <= 1.0:
-                colors = (colors * 255).astype(np.uint8)
-            else:
-                colors = colors.astype(np.uint8)
+        for idx in tqdm(range(num_frames), desc='Processing point clouds'):
+            mask = prediction_frames[idx][1]
+            points = canonical_points_frames[idx][mask]
+            colors = image_frames[idx][mask]
+            # Ensure colors are in 0-255 uint8 format
+            if colors.dtype != np.uint8:
+                if colors.max() <= 1.0:
+                    colors = (colors * 255).astype(np.uint8)
+                else:
+                    colors = colors.astype(np.uint8)
+            
+            # Save individual point cloud
+            frame_ply_path = separate_pc_dir / f'frame_{idx:05d}.ply'
+            write_ply(frame_ply_path, points, colors)
+            
+            # Add to combined point cloud (every 15th frame)
+            if idx % 15 == 0:
+                combined_points.append(points)
+                combined_colors.append(colors)
         
-        # Save individual point cloud
-        frame_ply_path = separate_pc_dir / f'frame_{idx:05d}.ply'
-        write_ply(frame_ply_path, points, colors)
+        combined_points = np.concatenate(combined_points, axis=0)
+        combined_colors = np.concatenate(combined_colors, axis=0)
+    
+        # Downsample point cloud if voxel_size > 0
+        if voxel_size > 0:
+            print(f'Downsampling point cloud with voxel size {voxel_size}...')
+            original_count = combined_points.shape[0]
+            combined_points, combined_colors = downsample_pointcloud_voxel(combined_points, combined_colors, voxel_size=voxel_size)
+            print(f'Downsampled from {original_count} to {combined_points.shape[0]} points ({100 * combined_points.shape[0] / original_count:.1f}%)')
         
-        # Add to combined point cloud (every 15th frame)
-        if idx % 15 == 0:
-            combined_points.append(points)
-            combined_colors.append(colors)
-    
-    combined_points = np.concatenate(combined_points, axis=0)
-    combined_colors = np.concatenate(combined_colors, axis=0)
-    
-    # Downsample point cloud if voxel_size > 0
-    if voxel_size > 0:
-        print(f'Downsampling point cloud with voxel size {voxel_size}...')
-        original_count = combined_points.shape[0]
-        combined_points, combined_colors = downsample_pointcloud_voxel(combined_points, combined_colors, voxel_size=voxel_size)
-        print(f'Downsampled from {original_count} to {combined_points.shape[0]} points ({100 * combined_points.shape[0] / original_count:.1f}%)')
-    
-    # Save combined point cloud with camera frustums to PLY
-    ply_output_path = Path(output_path, video_name, 'combined_pointcloud.ply')
-    print(f'Saving combined point cloud to {ply_output_path}...')
-    write_ply(ply_output_path, combined_points, combined_colors)
+        # Save combined point cloud with camera frustums to PLY
+        ply_output_path = Path(output_path, video_name, 'combined_pointcloud.ply')
+        print(f'Saving combined point cloud to {ply_output_path}...')
+        write_ply(ply_output_path, combined_points, combined_colors)
     
     # Render
     if camera_path is not None:
         render_height, render_width = 768, 1024
 
-        # Load camera trajectory
+        # Load camera trajectory config first (for up vector, fov, and forward axis config)
         with open(camera_path, 'r') as f:
             camera_config = json.load(f)
             eye_traj = CubicSpline(
@@ -411,20 +412,65 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
                 projection=render_projection,
                 return_depth=True
             )
-            # Render camera frustum
+            
+            # Render camera frustum by projecting vertices to 2D and drawing with OpenCV
+            # This avoids depth test issues with rasterize_lines
             camera_vertices, camera_edges, _ = utils3d.np.create_camera_frustum_mesh(extrinsics, intrinsics, 0.1)
-            render_output = utils3d.np.rasterize_lines(
-                (render_height, render_width),
-                vertices=camera_vertices,
-                lines=camera_edges,
-                attributes=np.array([[0, 255, 0]], dtype=np.float32).repeat(camera_vertices.shape[0], axis=0),
-                view=render_view,
-                projection=render_projection,
-                line_width=3,
-                background=render_output,
-                return_depth=True
-            )
-            render_image = np.where(render_output['mask'][:, :, None], render_output['image'], 255).astype(np.uint8)    # White background
+            # Transform vertices to clip space
+            vertices_homogeneous = np.concatenate([camera_vertices, np.ones((camera_vertices.shape[0], 1), dtype=np.float32)], axis=1)
+            vertices_clip = (render_projection @ render_view @ vertices_homogeneous.T).T
+            # Perspective divide
+            vertices_ndc = vertices_clip[:, :3] / (vertices_clip[:, 3:4] + 1e-8)
+            # Convert to screen coordinates
+            vertices_screen = np.zeros((camera_vertices.shape[0], 2), dtype=np.int32)
+            vertices_screen[:, 0] = ((vertices_ndc[:, 0] + 1) * 0.5 * render_width).astype(np.int32)
+            vertices_screen[:, 1] = ((1 - vertices_ndc[:, 1]) * 0.5 * render_height).astype(np.int32)
+            
+            # Prepare point cloud image
+            point_cloud_image = render_output['image'].copy()
+            if point_cloud_image.max() <= 1.0:
+                point_cloud_image = (point_cloud_image * 255).astype(np.uint8)
+            else:
+                point_cloud_image = point_cloud_image.astype(np.uint8)
+            
+            # Create a white canvas
+            render_image = np.ones((render_height, render_width, 3), dtype=np.uint8) * 255
+            
+            # First composite point cloud (only where mask is True)
+            render_image = np.where(render_output['mask'][:, :, None], point_cloud_image, render_image).astype(np.uint8)
+            
+            # Create a separate image for frustum (draw on white background first)
+            frustum_image = np.ones((render_height, render_width, 3), dtype=np.uint8) * 255
+            frustum_image_bgr = cv2.cvtColor(frustum_image, cv2.COLOR_RGB2BGR)
+            
+            # Draw all frustum edges on the separate image
+            for edge in camera_edges:
+                v0_idx, v1_idx = edge[0], edge[1]
+                w0, w1 = vertices_clip[v0_idx, 3], vertices_clip[v1_idx, 3]
+                if w0 > 0 and w1 > 0:
+                    ndc0 = vertices_ndc[v0_idx]
+                    ndc1 = vertices_ndc[v1_idx]
+                    if not ((ndc0[0] < -1 and ndc1[0] < -1) or (ndc0[0] > 1 and ndc1[0] > 1) or
+                            (ndc0[1] < -1 and ndc1[1] < -1) or (ndc0[1] > 1 and ndc1[1] > 1)):
+                        pt0 = (int(np.clip(vertices_screen[v0_idx, 0], 0, render_width - 1)), 
+                               int(np.clip(vertices_screen[v0_idx, 1], 0, render_height - 1)))
+                        pt1 = (int(np.clip(vertices_screen[v1_idx, 0], 0, render_width - 1)), 
+                               int(np.clip(vertices_screen[v1_idx, 1], 0, render_height - 1)))
+                        cv2.line(frustum_image_bgr, pt0, pt1, (0, 255, 0), 2)
+            
+            # Convert frustum image back to RGB
+            frustum_image = cv2.cvtColor(frustum_image_bgr, cv2.COLOR_BGR2RGB)
+            
+            # Create mask for frustum pixels (green pixels, not white background)
+            frustum_mask = np.all(frustum_image == [0, 255, 0], axis=2)
+            
+            # Composite: overlay frustum on top of point cloud
+            # Where frustum exists, use frustum (green), otherwise use point cloud/background
+            render_image = np.where(
+                frustum_mask[:, :, None], 
+                frustum_image, 
+                render_image
+            ).astype(np.uint8)
             render_frames.append(render_image)
 
         # Save rendered video
