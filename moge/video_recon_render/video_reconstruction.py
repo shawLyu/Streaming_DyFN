@@ -372,21 +372,86 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
     if camera_path is not None:
         render_height, render_width = 768, 1024
 
+        # Extract computed camera positions from poses
+        computed_eye_positions = []
+        computed_look_at_positions = []
+        
+        # Compute average point cloud center for look_at reference
+        all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
+        point_cloud_center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
+        
+        for idx in range(num_frames):
+            pose, intrinsics = pose_frames[idx]
+            # Extract camera position (translation part of pose)
+            eye_pos = pose[:3, 3]
+            computed_eye_positions.append(eye_pos)
+            
+            # Compute look_at position: use the center of visible points for this frame
+            # This ensures the camera looks at the scene it's observing
+            frame_points = canonical_points_frames[idx][prediction_frames[idx][1]]
+            if len(frame_points) > 0:
+                # Use center of visible points in this frame
+                frame_center = frame_points.mean(axis=0)
+                look_at_pos = frame_center
+            else:
+                # Fallback: use global point cloud center
+                look_at_pos = point_cloud_center
+            
+            computed_look_at_positions.append(look_at_pos)
+        
+        computed_eye_positions = np.array(computed_eye_positions, dtype=np.float32)
+        computed_look_at_positions = np.array(computed_look_at_positions, dtype=np.float32)
+
+        # Create blended trajectory: start with computed trajectory, gradually transition to user trajectory
+        transition_frames = min(50, num_frames // 2)  # Transition over first 30 frames or 1/3 of video
+
         # Load camera trajectory config first (for up vector, fov, and forward axis config)
         with open(camera_path, 'r') as f:
             camera_config = json.load(f)
-            eye_traj = CubicSpline(
+            camera_config['eye'][0] = computed_eye_positions[transition_frames].tolist()
+            camera_config['look_at'][0] = computed_look_at_positions[transition_frames].tolist()
+            user_eye_traj = CubicSpline(
                 np.linspace(0, num_frames - 1, len(camera_config['eye'])), 
                 np.array(camera_config['eye'], dtype=np.float32), 
                 bc_type="periodic" if camera_config['eye'][0] == camera_config['eye'][-1] else "not-a-knot"
             )
-            look_at_traj = CubicSpline(
+            user_look_at_traj = CubicSpline(
                 np.linspace(0, num_frames - 1, len(camera_config['look_at'])), 
                 np.array(camera_config['look_at'], dtype=np.float32), 
                 bc_type="periodic" if camera_config['look_at'][0] == camera_config['look_at'][-1] else "not-a-knot"
             )
             up = np.array(camera_config['up'], dtype=np.float32)
         render_projection = utils3d.np.perspective_from_fov(fov_y=np.deg2rad(camera_config['fov']), near=0.01, far=np.inf, aspect_ratio=render_width / render_height)
+        
+        
+        def blended_eye_traj(frame_idx):
+            if frame_idx < transition_frames:
+                # Blend between computed and user trajectory
+                alpha = frame_idx / transition_frames  # 0 to 1
+                computed_eye = computed_eye_positions[int(frame_idx)]
+                user_eye = user_eye_traj(frame_idx)
+                return computed_eye * (1 - alpha) + user_eye * alpha
+            else:
+                # Use user trajectory after transition
+                return user_eye_traj(frame_idx)
+        
+        def get_point_cloud_center(frame_idx):
+            """
+            Get the center of visible point cloud for the given frame.
+            This will be used as look_at target.
+            """
+            _, mask = prediction_frames[frame_idx]
+            frame_points = canonical_points_frames[frame_idx][mask]
+            if len(frame_points) > 0:
+                return frame_points.mean(axis=0)
+            else:
+                # Fallback to global point cloud center
+                all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
+                return all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
+        
+        def blended_look_at_traj(frame_idx):
+            # Always use point cloud center as look_at target
+            return get_point_cloud_center(frame_idx)
 
         # Save input video
         Path(output_path, video_name, 'video').mkdir(exist_ok=True)
@@ -413,7 +478,7 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
         render_frames = []
         for idx in trange(num_frames, desc='Render'):
             _, mask = prediction_frames[idx]
-            render_view = utils3d.np.view_look_at(eye=eye_traj(idx), look_at=look_at_traj(idx), up=up).astype(np.float32)
+            render_view = utils3d.np.view_look_at(eye=blended_eye_traj(idx), look_at=blended_look_at_traj(idx), up=up).astype(np.float32)
 
             # Render point cloud
             render_output = utils3d.np.rasterize_point_cloud(
