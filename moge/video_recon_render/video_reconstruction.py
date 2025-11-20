@@ -234,7 +234,8 @@ def find_correspondence_by_pdcnet(pdcnet_model, image_ref: np.ndarray, mask_ref:
 @click.option('--fps', type=int, default=24, help='Output video FPS')
 @click.option('--voxel-size', 'voxel_size', type=float, default=0.002, help='Voxel size for point cloud downsampling (0 to disable)')
 @click.option('--image_based', is_flag=True, help='Use image-based inference.')
-def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, image_based: bool):
+@click.option('--accumulate-pointcloud-interval', 'accumulate_pc_interval', type=int, default=15, help='Accumulate point clouds from previous frames every k frames (0 to disable, only render current frame)')
+def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, image_based: bool, accumulate_pc_interval: int):
     if Path(video_path).is_file():
         image_frames = read_frames_from_video(video_path, start, end, skip, target_size=input_size)
     elif Path(video_path).is_dir():
@@ -480,11 +481,50 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             _, mask = prediction_frames[idx]
             render_view = utils3d.np.view_look_at(eye=blended_eye_traj(idx), look_at=blended_look_at_traj(idx), up=up).astype(np.float32)
 
+            # Collect points from current frame and previous frames (every k frames)
+            if accumulate_pc_interval > 0:
+                # Collect frame indices: current frame + previous frames every k frames
+                frame_indices = []
+                for prev_idx in range(0, idx + 1, accumulate_pc_interval):
+                    frame_indices.append(prev_idx)
+                # Always include current frame
+                if idx not in frame_indices:
+                    frame_indices.append(idx)
+                frame_indices.sort()
+                
+                # Collect all points and colors from selected frames
+                all_points = []
+                all_colors = []
+                for frame_idx in frame_indices:
+                    frame_mask = prediction_frames[frame_idx][1]
+                    frame_points = canonical_points_frames[frame_idx][frame_mask]
+                    frame_colors = image_frames[frame_idx][frame_mask]
+                    all_points.append(frame_points)
+                    all_colors.append(frame_colors)
+                
+                # Concatenate all points and colors
+                combined_points = np.concatenate(all_points, axis=0).astype(np.float32)
+                combined_colors = np.concatenate(all_colors, axis=0).astype(np.float32)
+                
+                # Normalize colors if needed
+                if combined_colors.max() <= 1.0:
+                    combined_colors = (combined_colors * 255).astype(np.uint8)
+                else:
+                    combined_colors = combined_colors.astype(np.uint8)
+            else:
+                # Only render current frame
+                combined_points = canonical_points_frames[idx][mask].astype(np.float32)
+                combined_colors = image_frames[idx][mask]
+                if combined_colors.max() <= 1.0:
+                    combined_colors = (combined_colors * 255).astype(np.uint8)
+                else:
+                    combined_colors = combined_colors.astype(np.uint8)
+
             # Render point cloud
             render_output = utils3d.np.rasterize_point_cloud(
                 (render_height, render_width),
-                points=canonical_points_frames[idx][mask].astype(np.float32),
-                attributes=image_frames[idx][mask].astype(np.float32),
+                points=combined_points,
+                attributes=combined_colors.astype(np.float32),
                 point_sizes=3,
                 point_shape='circle',
                 view=render_view,
