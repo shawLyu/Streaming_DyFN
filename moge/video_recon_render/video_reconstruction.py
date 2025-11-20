@@ -46,7 +46,7 @@ def solve_pose_ransac(
     for _ in range(max_iters):
         maybe_inliers = np.random.choice(n, size=hypothetical_size, replace=False)
         try:
-            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='rigid')
+            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='similar')
         except np.linalg.LinAlgError:
             continue
         transformed_p = utils3d.np.transform_points(p, pose)
@@ -56,7 +56,7 @@ def solve_pose_ransac(
         score = inlier_thresh * n - np.clip(errors, None, inlier_thresh).sum()
         if score > best_score:
             best_score, best_inlines = score, inliers
-            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='rigid')
+            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='similar')
     
     return best_solution, best_inlines
 
@@ -234,7 +234,7 @@ def find_correspondence_by_pdcnet(pdcnet_model, image_ref: np.ndarray, mask_ref:
 @click.option('--fps', type=int, default=24, help='Output video FPS')
 @click.option('--voxel-size', 'voxel_size', type=float, default=0.002, help='Voxel size for point cloud downsampling (0 to disable)')
 @click.option('--image_based', is_flag=True, help='Use image-based inference.')
-@click.option('--accumulate-pointcloud-interval', 'accumulate_pc_interval', type=int, default=15, help='Accumulate point clouds from previous frames every k frames (0 to disable, only render current frame)')
+@click.option('--accumulate-pointcloud-interval', 'accumulate_pc_interval', type=int, default=0, help='Accumulate point clouds from previous frames every k frames (0 to disable, only render current frame)')
 def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, image_based: bool, accumulate_pc_interval: int):
     if Path(video_path).is_file():
         image_frames = read_frames_from_video(video_path, start, end, skip, target_size=input_size)
@@ -403,6 +403,41 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
         computed_eye_positions = np.array(computed_eye_positions, dtype=np.float32)
         computed_look_at_positions = np.array(computed_look_at_positions, dtype=np.float32)
 
+        # Smooth the computed camera trajectories to reduce jitter
+        def smooth_trajectory(positions, window_size=5):
+            """
+            Smooth trajectory using moving average with edge handling.
+            """
+            if len(positions) < 3:
+                return positions
+            
+            smoothed = np.zeros_like(positions)
+            half_window = window_size // 2
+            
+            for i in range(len(positions)):
+                # Determine window bounds
+                start = max(0, i - half_window)
+                end = min(len(positions), i + half_window + 1)
+                
+                # Use available points in window
+                window = positions[start:end]
+                smoothed[i] = window.mean(axis=0)
+            
+            return smoothed
+        
+        # Apply smoothing to camera positions and look_at positions
+        smoothed_eye_positions = smooth_trajectory(computed_eye_positions, window_size=5)
+        smoothed_look_at_positions = smooth_trajectory(computed_look_at_positions, window_size=5)
+        
+        # Create cubic spline interpolation for even smoother trajectories
+        if num_frames > 3:
+            frame_indices = np.arange(num_frames, dtype=np.float32)
+            eye_spline = CubicSpline(frame_indices, smoothed_eye_positions, bc_type='natural')
+            look_at_spline = CubicSpline(frame_indices, smoothed_look_at_positions, bc_type='natural')
+        else:
+            eye_spline = None
+            look_at_spline = None
+
         # Create blended trajectory: start with computed trajectory, gradually transition to user trajectory
         transition_frames = min(50, num_frames // 2)  # Transition over first 30 frames or 1/3 of video
 
@@ -429,30 +464,90 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             if frame_idx < transition_frames:
                 # Blend between computed and user trajectory
                 alpha = frame_idx / transition_frames  # 0 to 1
-                computed_eye = computed_eye_positions[int(frame_idx)]
+                # Use spline interpolation for smooth computed trajectory
+                if eye_spline is not None:
+                    computed_eye = eye_spline(frame_idx)
+                else:
+                    computed_eye = smoothed_eye_positions[int(frame_idx)]
                 user_eye = user_eye_traj(frame_idx)
                 return computed_eye * (1 - alpha) + user_eye * alpha
             else:
                 # Use user trajectory after transition
                 return user_eye_traj(frame_idx)
         
-        def get_point_cloud_center(frame_idx):
-            """
-            Get the center of visible point cloud for the given frame.
-            This will be used as look_at target.
-            """
-            _, mask = prediction_frames[frame_idx]
-            frame_points = canonical_points_frames[frame_idx][mask]
-            if len(frame_points) > 0:
-                return frame_points.mean(axis=0)
+        # Pre-compute all point cloud centers for smooth look_at trajectory
+        raw_look_at_centers = []
+        for idx in range(num_frames):
+            if accumulate_pc_interval > 0:
+                # Collect frame indices: current frame + previous frames every k frames
+                frame_indices = []
+                for prev_idx in range(0, idx + 1, accumulate_pc_interval):
+                    frame_indices.append(prev_idx)
+                # Always include current frame
+                if idx not in frame_indices:
+                    frame_indices.append(idx)
+                frame_indices.sort()
+                
+                # Collect all points from selected frames
+                all_points = []
+                for frame_idx_sel in frame_indices:
+                    frame_mask = prediction_frames[frame_idx_sel][1]
+                    frame_points = canonical_points_frames[frame_idx_sel][frame_mask]
+                    if len(frame_points) > 0:
+                        all_points.append(frame_points)
+                
+                if len(all_points) > 0:
+                    combined_points = np.concatenate(all_points, axis=0)
+                    center = combined_points.mean(axis=0)
+                else:
+                    # Fallback to global point cloud center
+                    all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
+                    center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
             else:
-                # Fallback to global point cloud center
-                all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
-                return all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
+                # Only use current frame point cloud center
+                _, mask = prediction_frames[idx]
+                frame_points = canonical_points_frames[idx][mask]
+                if len(frame_points) > 0:
+                    center = frame_points.mean(axis=0)
+                else:
+                    # Fallback to global point cloud center
+                    all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
+                    center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
+            raw_look_at_centers.append(center)
+        
+        raw_look_at_centers = np.array(raw_look_at_centers, dtype=np.float32)
+        
+        # Apply strong smoothing to look_at centers to reduce jitter
+        # Use larger window for look_at smoothing
+        smoothed_look_at_centers = smooth_trajectory(raw_look_at_centers, window_size=9)
+        
+        # Apply exponential moving average for additional smoothing
+        def exponential_smooth(positions, alpha=0.3):
+            """Apply exponential moving average for smoother transitions."""
+            if len(positions) < 2:
+                return positions
+            smoothed = np.zeros_like(positions)
+            smoothed[0] = positions[0]
+            for i in range(1, len(positions)):
+                smoothed[i] = alpha * positions[i] + (1 - alpha) * smoothed[i-1]
+            return smoothed
+        
+        # Apply exponential smoothing on top of moving average
+        smoothed_look_at_centers = exponential_smooth(smoothed_look_at_centers, alpha=0.4)
+        
+        # Create spline interpolation for smooth look_at trajectory
+        if num_frames > 3:
+            frame_indices = np.arange(num_frames, dtype=np.float32)
+            look_at_center_spline = CubicSpline(frame_indices, smoothed_look_at_centers, bc_type='natural')
+        else:
+            look_at_center_spline = None
         
         def blended_look_at_traj(frame_idx):
-            # Always use point cloud center as look_at target
-            return get_point_cloud_center(frame_idx)
+            # Use spline-interpolated smoothed point cloud center as look_at target
+            if look_at_center_spline is not None:
+                return look_at_center_spline(frame_idx)
+            else:
+                return smoothed_look_at_centers[int(frame_idx)]
 
         # Save input video
         Path(output_path, video_name, 'video').mkdir(exist_ok=True)
