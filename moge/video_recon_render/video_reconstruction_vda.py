@@ -8,7 +8,6 @@ os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'    # A workaround for potential compatibility issue with Windows
 import itertools
 import json
-import json
 import warnings
 
 import numpy as np
@@ -23,7 +22,7 @@ from scipy.interpolate import CubicSpline
 import open3d as o3d
 from omegaconf import DictConfig
 
-from baselines.flashdepth.model import FlashDepth
+from video_depth_anything.video_depth import VideoDepthAnything
 from third_party_models import pdcnet
 
 
@@ -288,6 +287,10 @@ def intrinsics_from_fov(fov_x: float, height: int, width: int) -> np.ndarray:
     return intrinsics
 
 
+def ensure_even(value: int) -> int:
+    """Ensure value is even."""
+    return value if value % 2 == 0 else value - 1
+
 
 @click.command()
 @click.option('--video', 'video_path', type=str, help='Input video path')
@@ -298,13 +301,15 @@ def intrinsics_from_fov(fov_x: float, height: int, width: int) -> np.ndarray:
 @click.option('--input_size', type=int, default=640, help='Resize the input video to a specific size (longer side)')
 @click.option('--ref-offset', 'ref_offset', type=click.Tuple([int, int, int]), default=[1, 5, 21], help='Reference frame offset')
 @click.option('--camera', 'camera_path', type=str, default=None, help='Trajectory file path')
-@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, required=True, help='Path to FlashDepth pretrained model checkpoint')
+@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, required=True, help='Path to VideoDepthAnything pretrained model checkpoint')
 @click.option('--output', 'output_path', type=str, default='video_output', help='Output directory')
 @click.option('--fps', type=int, default=24, help='Output video FPS')
-@click.option('--voxel-size', 'voxel_size', type=float, default=0.00002, help='Voxel size for point cloud downsampling (0 to disable)')
-@click.option('--max_res', type=int, default=1024, help='Maximum resolution dimension for model inference')
+@click.option('--voxel-size', 'voxel_size', type=float, default=0.00001, help='Voxel size for point cloud downsampling (0 to disable)')
+@click.option('--max_res', type=int, default=1280, help='Maximum resolution dimension for model inference')
+@click.option('--input_size_model', type=int, default=518, help='Input size for VideoDepthAnything model inference')
+@click.option('--target_fps', type=int, default=-1, help='Target FPS for VideoDepthAnything inference (-1 to use original FPS)')
 @click.option('--accumulate-pointcloud-interval', 'accumulate_pc_interval', type=int, default=0, help='Accumulate point clouds from previous frames every k frames (0 to disable, only render current frame)')
-def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, max_res: int, accumulate_pc_interval: int):
+def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, max_res: int, input_size_model: int, target_fps: int, accumulate_pc_interval: int):
     if Path(video_path).is_file():
         image_frames = read_frames_from_video(video_path, start, end, skip, target_size=input_size)
     elif Path(video_path).is_dir():
@@ -339,110 +344,69 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             pose_frames.append((pose, intrinsics))
             inlier_mask_frames.append(inlier_mask)
     else:
-        # Load FlashDepth model
-        print(f"==> Loading FlashDepth model: {pretrained_model_name_or_path}")
+        # Load VideoDepthAnything model
+        print(f"==> Loading VideoDepthAnything model: {pretrained_model_name_or_path}")
         warnings.filterwarnings("ignore", category=RuntimeWarning)
         
-        # Hardcoded configs (following recon_scannet_flashdepth.py)
-        hybrid_configs = {
-            'use_hybrid': False, 
-            'teacher_model_path': None, 
-            'teacher_resolution': 490, 
-            'layers_to_skip': [1, 2, 3], 
-            'num_blocks': 4, 
-            'mlp_expand': 2, 
-            'num_heads': 2
-        }
+        # Model configs for VideoDepthAnything (following eval_video_long_vda.py)
         model_configs = {
-            'vit_size': 'vitl',
-            'patch_size': 14,
-            'attn_class': 'MemEffAttention',
-            'use_mamba': True, 
-            'mamba_type': 'add', 
-            'num_mamba_layers': 4, 
-            'downsample_mamba': [0.1], 
-            'mamba_pos_embed': None, 
-            'mamba_in_dpt_layer': [3], 
-            'mamba_d_conv': 4, 
-            'mamba_d_state': 256, 
-            'use_hydra': False, 
-            'use_transformer_rnn': False, 
-            'use_xlstm': False,
-        }
-
-        eval_args = {
-            'save_depth_npy': False,
-            'save_vis_map': False,
-            'out_video': False,
-            'out_mp4': False,
-            'use_mamba': True,
-            'resolution': 518,
-            'print_time': True,
-            'loss_type': 'l1',
-            'use_all_frames': True,
-            'use_metrics': False,
-            'dummy_timing': False
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
         }
         
-        flashdepth_model = FlashDepth(**dict( 
-            batch_size=1, 
-            hybrid_configs=DictConfig(hybrid_configs),
-            training=False,
-            **DictConfig(model_configs),
-        )).to(device)
-        flashdepth_model.load_state_dict(torch.load(pretrained_model_name_or_path, weights_only=True)["model"])
-        flashdepth_model.eval()
+        # Initialize VideoDepthAnything model with vitl config
+        vda_model = VideoDepthAnything(**model_configs['vitl'], metric="video_depth_anything")
+        vda_model.load_state_dict(torch.load(pretrained_model_name_or_path, map_location='cpu'), strict=True)
+        vda_model = vda_model.to(device).eval()
         print(f"==> Model loaded on {device}")
         
-        # Prepare images for FlashDepth inference
-        print("==> Preparing images for FlashDepth inference...")
-        color_images = []
+        # Prepare frames for VideoDepthAnything inference
+        # VideoDepthAnything expects frames as numpy array in RGB format
+        print("==> Preparing frames for VideoDepthAnything inference...")
+        frames_array = []
         original_sizes = []
         for curr_image in image_frames:
             h, w = curr_image.shape[:2]
             original_sizes.append((h, w))
             
-            # Resize to be divisible by patch_size (14) and within max_res
-            patch_size = 14
-            height = round(h / patch_size) * patch_size
-            width = round(w / patch_size) * patch_size
-            
-            if max(height, width) > max_res:
+            # Resize if needed to fit within max_res
+            if max_res > 0 and max(h, w) > max_res:
                 scale = max_res / max(h, w)
-                height = round(h * scale / patch_size) * patch_size
-                width = round(w * scale / patch_size) * patch_size
-            
-            if (height, width) != (h, w):
-                curr_image_resized = cv2.resize(curr_image, (width, height), interpolation=cv2.INTER_LINEAR)
+                new_h = ensure_even(round(h * scale))
+                new_w = ensure_even(round(w * scale))
+                curr_image_resized = cv2.resize(curr_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             else:
                 curr_image_resized = curr_image
             
-            color_images.append(curr_image_resized.astype(np.float32) / 255.0)
+            # Ensure image is in uint8 format (0-255)
+            if curr_image_resized.dtype != np.uint8:
+                if curr_image_resized.max() <= 1.0:
+                    curr_image_resized = (curr_image_resized * 255).astype(np.uint8)
+                else:
+                    curr_image_resized = curr_image_resized.astype(np.uint8)
+            
+            frames_array.append(curr_image_resized)
         
-        # Run FlashDepth inference on all frames
-        print(f"==> Running FlashDepth inference on {num_frames} frames...")
+        # Stack frames into numpy array: (N, H, W, 3)
+        frames_array = np.stack(frames_array, axis=0)
+        
+        # Run VideoDepthAnything inference on all frames
+        print(f"==> Running VideoDepthAnything inference on {num_frames} frames...")
         with torch.no_grad():
-            image_tensor = torch.from_numpy(np.stack(color_images)).permute(0, 3, 1, 2).to(device)
-            # Ensure dimensions are divisible by patch_size
-            if image_tensor.shape[-2] % 14 != 0 or image_tensor.shape[-1] % 14 != 0:
-                h_new = image_tensor.shape[-2] // 14 * 14
-                w_new = image_tensor.shape[-1] // 14 * 14
-                image_tensor = F.interpolate(image_tensor, (h_new, w_new), mode='bilinear', align_corners=False)
-            
-            output = flashdepth_model(image_tensor.unsqueeze(0), **eval_args)
-            depth_est_all = output['depth'].cpu().numpy()  # Shape: [B, N, H, W]
-            
-            # Handle depth shape: [B, N, H, W] -> [N, H, W]
-            if depth_est_all.ndim == 4:
-                # Remove batch dimension (B=1)
-                depth_est_all = depth_est_all.squeeze(0)  # Now shape: [N, H, W]
-            elif depth_est_all.ndim == 3:
-                # Already in [N, H, W] format
-                pass
-            else:
-                raise ValueError(f"Unexpected depth shape: {depth_est_all.shape}")
+            # VideoDepthAnything.infer_video_depth expects frames as numpy array
+            # Returns depths as numpy array and fps
+            depths, inferred_fps = vda_model.infer_video_depth(
+                frames_array, 
+                target_fps, 
+                input_size=input_size_model, 
+                device=device.type, 
+                fp32=True
+            )
+            depths = 1 / depths
         
-        print(f"==> FlashDepth inference complete. Depth shape: {depth_est_all.shape}")
+        # depths shape: (N, H, W) - numpy array
+        print(f"==> VideoDepthAnything inference complete. Depth shape: {depths.shape}, FPS: {inferred_fps}")
         
         # Compute intrinsics from fov_x if provided, otherwise estimate from image size
         if fov_x is not None:
@@ -466,10 +430,10 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             h_orig, w_orig = original_sizes[i_curr]
             
             # Get depth for current frame
-            if i_curr >= depth_est_all.shape[0]:
-                print(f"Warning: Frame {i_curr} exceeds depth array size {depth_est_all.shape[0]}. Skipping.")
+            if i_curr >= depths.shape[0]:
+                print(f"Warning: Frame {i_curr} exceeds depth array size {depths.shape[0]}. Skipping.")
                 continue
-            d_est = depth_est_all[i_curr].copy()  # Shape: [H, W]
+            d_est = depths[i_curr].copy()  # Shape: [H, W]
             
             # Resize depth to original image size if needed
             if d_est.shape != (h_orig, w_orig):
@@ -491,8 +455,7 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             curr_points = depth_to_points(d_est, intrinsics_scaled)
             
             # Create mask (valid depth points)
-            curr_mask = d_est < 100
-            curr_mask &= ~utils3d.np.depth_map_edge(d_est, rtol=0.05, mask=None)
+            curr_mask = ~utils3d.np.depth_map_edge(d_est, rtol=0.05, mask=None)
             
             # Solve pose
             if i_curr == 0:
@@ -922,5 +885,4 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
 
 if __name__ == '__main__':
     main()
-
 
