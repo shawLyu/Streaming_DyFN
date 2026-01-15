@@ -97,7 +97,7 @@ def normalize_svd(svd_img, vmin, vmax):
 @click.command(help='Video Depth Inference Demo')
 @click.option('--video_path', type=click.Path(exists=True), required=True, help='Path to input video file')
 @click.option('--fov_x', 'fov_x_', type=float, default=None, help='If camera parameters are known, set the horizontal field of view in degrees. Otherwise, MoGe will estimate it.')
-@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')
+@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='shawlyu/StreamingMoGE', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')
 @click.option('--output_dir', type=click.Path(), default='outputs', help='Directory to save output results')
 @click.option('--save_video', is_flag=True, help='Save output as video')
 @click.option('--target_fps', type=int, default=15, help='Target frames per second for video processing')

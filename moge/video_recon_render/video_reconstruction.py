@@ -46,7 +46,7 @@ def solve_pose_ransac(
     for _ in range(max_iters):
         maybe_inliers = np.random.choice(n, size=hypothetical_size, replace=False)
         try:
-            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='rigid')
+            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='affine')
         except np.linalg.LinAlgError:
             continue
         transformed_p = utils3d.np.transform_points(p, pose)
@@ -56,7 +56,7 @@ def solve_pose_ransac(
         score = inlier_thresh * n - np.clip(errors, None, inlier_thresh).sum()
         if score > best_score:
             best_score, best_inlines = score, inliers
-            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='rigid')
+            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='affine')
     
     return best_solution, best_inlines
 
@@ -288,8 +288,8 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             # Solve pose
             if i_curr == 0:
                 # For the first frame, just normalize the scale and set identity pose
-                # pose = np.mean(1 / curr_points[curr_mask, 2]) * np.eye(4, dtype=np.float32)
-                pose = np.eye(4, dtype=np.float32)
+                pose = np.mean(1 / curr_points[curr_mask, 2]) * np.eye(4, dtype=np.float32)
+                # pose = np.eye(4, dtype=np.float32)
                 inlier_mask = np.zeros_like(curr_mask, dtype=bool)
             else:
                 # Similar registration with previous reference frames
