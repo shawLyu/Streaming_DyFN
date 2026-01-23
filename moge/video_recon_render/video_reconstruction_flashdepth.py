@@ -304,7 +304,14 @@ def intrinsics_from_fov(fov_x: float, height: int, width: int) -> np.ndarray:
 @click.option('--voxel-size', 'voxel_size', type=float, default=0.00002, help='Voxel size for point cloud downsampling (0 to disable)')
 @click.option('--max_res', type=int, default=1024, help='Maximum resolution dimension for model inference')
 @click.option('--accumulate-pointcloud-interval', 'accumulate_pc_interval', type=int, default=0, help='Accumulate point clouds from previous frames every k frames (0 to disable, only render current frame)')
-def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, max_res: int, accumulate_pc_interval: int):
+@click.option('--fixed-view', 'use_fixed_view', is_flag=True, help='Use fixed camera view instead of trajectory')
+@click.option('--fixed-eye', type=click.Tuple([float, float, float]), default=None, help='Fixed camera eye position (x, y, z). If not provided, will use a default position based on point cloud')
+@click.option('--fixed-look-at', type=click.Tuple([float, float, float]), default=None, help='Fixed camera look_at position (x, y, z). If not provided, will use point cloud center')
+@click.option('--fixed-fov', type=float, default=60.0, help='Field of view in degrees for fixed view (default: 60.0)')
+@click.option('--fixed-up', type=click.Tuple([float, float, float]), default=(0.5, -1, 0.0), help='Up vector for fixed view (default: (0, 1, 0))')
+@click.option('--rescale-pointcloud', 'rescale_pointcloud', is_flag=True, help='Rescale point cloud to a target size for consistent rendering')
+@click.option('--target-scale', type=float, default=1.0, help='Target scale for point cloud rescaling (default: 1.0, meaning normalize to unit size)')
+def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, max_res: int, accumulate_pc_interval: int, use_fixed_view: bool, fixed_eye: Tuple[float, float, float], fixed_look_at: Tuple[float, float, float], fixed_fov: float, fixed_up: Tuple[float, float, float], rescale_pointcloud: bool, target_scale: float):
     if Path(video_path).is_file():
         image_frames = read_frames_from_video(video_path, start, end, skip, target_size=input_size)
     elif Path(video_path).is_dir():
@@ -578,184 +585,272 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
     write_ply(ply_output_path, combined_points, combined_colors)
     
     # Render
-    if camera_path is not None:
+    if camera_path is not None or use_fixed_view:
         render_height, render_width = 768, 1024
 
-        # Extract computed camera positions from poses
-        computed_eye_positions = []
-        computed_look_at_positions = []
-        
         # Compute average point cloud center for look_at reference
         all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
         point_cloud_center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
         
-        for idx in range(num_frames):
-            pose, intrinsics = pose_frames[idx]
-            # Extract camera position (translation part of pose)
-            eye_pos = pose[:3, 3]
-            computed_eye_positions.append(eye_pos)
+        # Rescale point cloud if requested
+        rescale_factor = 1.0
+        if rescale_pointcloud and len(all_points) > 0:
+            # Calculate bounding box
+            bbox_min = all_points.min(axis=0)
+            bbox_max = all_points.max(axis=0)
+            bbox_size = np.linalg.norm(bbox_max - bbox_min)
             
-            # Compute look_at position: use the center of visible points for this frame
-            # This ensures the camera looks at the scene it's observing
-            frame_points = canonical_points_frames[idx][prediction_frames[idx][1]]
-            if len(frame_points) > 0:
-                # Use center of visible points in this frame
-                frame_center = frame_points.mean(axis=0)
-                look_at_pos = frame_center
+            if bbox_size > 1e-6:  # Avoid division by zero
+                # Calculate scale factor to normalize to target_scale
+                rescale_factor = target_scale / bbox_size
+                
+                print(f'Rescaling point cloud: bbox_size={bbox_size:.4f}, target_scale={target_scale:.4f}, scale_factor={rescale_factor:.4f}')
+                
+                # Rescale all point clouds and poses
+                # Note: This rescales both the point cloud and camera poses to maintain their relative positions
+                # All subsequent camera operations (trajectory computation, frustum rendering) will use rescaled poses
+                for i in range(num_frames):
+                    mask = prediction_frames[i][1]
+                    # Rescale point cloud: (points - center) * scale + center
+                    canonical_points_frames[i][mask] = (canonical_points_frames[i][mask] - point_cloud_center) * rescale_factor + point_cloud_center
+                    
+                    # Rescale pose translation: (translation - center) * scale + center
+                    # This ensures camera positions are scaled relative to the point cloud center
+                    pose, intrinsics = pose_frames[i]
+                    pose_translation = pose[:3, 3]
+                    pose[:3, 3] = (pose_translation - point_cloud_center) * rescale_factor + point_cloud_center
+                    pose_frames[i] = (pose, intrinsics)
+                    # Note: intrinsics are not rescaled as they represent camera internal parameters (focal length, principal point)
+                
+                # Update point cloud center (should remain the same after rescale)
+                # But recalculate to be safe
+                # This updated all_points will be used for base_frustum_size calculation
+                all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
+                point_cloud_center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
+        
+        # Handle fixed view mode
+        if use_fixed_view:
+            # Determine look_at position
+            if fixed_look_at is not None:
+                look_at_pos = np.array(fixed_look_at, dtype=np.float32)
+                # If rescaling, adjust look_at position relative to point cloud center
+                if rescale_pointcloud:
+                    # Rescale: (pos - center) * scale + center
+                    look_at_pos = (look_at_pos - point_cloud_center) * rescale_factor + point_cloud_center
             else:
-                # Fallback: use global point cloud center
                 look_at_pos = point_cloud_center
             
-            computed_look_at_positions.append(look_at_pos)
-        
-        computed_eye_positions = np.array(computed_eye_positions, dtype=np.float32)
-        computed_look_at_positions = np.array(computed_look_at_positions, dtype=np.float32)
-
-        # Smooth the computed camera trajectories to reduce jitter
-        def smooth_trajectory(positions, window_size=5):
-            """
-            Smooth trajectory using moving average with edge handling.
-            """
-            if len(positions) < 3:
-                return positions
-            
-            smoothed = np.zeros_like(positions)
-            half_window = window_size // 2
-            
-            for i in range(len(positions)):
-                # Determine window bounds
-                start = max(0, i - half_window)
-                end = min(len(positions), i + half_window + 1)
-                
-                # Use available points in window
-                window = positions[start:end]
-                smoothed[i] = window.mean(axis=0)
-            
-            return smoothed
-        
-        # Apply smoothing to camera positions and look_at positions
-        smoothed_eye_positions = smooth_trajectory(computed_eye_positions, window_size=5)
-        smoothed_look_at_positions = smooth_trajectory(computed_look_at_positions, window_size=5)
-        
-        # Create cubic spline interpolation for even smoother trajectories
-        if num_frames > 3:
-            frame_indices = np.arange(num_frames, dtype=np.float32)
-            eye_spline = CubicSpline(frame_indices, smoothed_eye_positions, bc_type='natural')
-            look_at_spline = CubicSpline(frame_indices, smoothed_look_at_positions, bc_type='natural')
-        else:
-            eye_spline = None
-            look_at_spline = None
-
-        # Create blended trajectory: start with computed trajectory, gradually transition to user trajectory
-        transition_frames = min(50, num_frames // 2)  # Transition over first 50 frames or 1/2 of video
-
-        # Load camera trajectory config first (for up vector, fov, and forward axis config)
-        with open(camera_path, 'r') as f:
-            camera_config = json.load(f)
-            camera_config['eye'][0] = computed_eye_positions[transition_frames].tolist()
-            camera_config['look_at'][0] = computed_look_at_positions[transition_frames].tolist()
-            user_eye_traj = CubicSpline(
-                np.linspace(0, num_frames - 1, len(camera_config['eye'])), 
-                np.array(camera_config['eye'], dtype=np.float32), 
-                bc_type="periodic" if camera_config['eye'][0] == camera_config['eye'][-1] else "not-a-knot"
-            )
-            user_look_at_traj = CubicSpline(
-                np.linspace(0, num_frames - 1, len(camera_config['look_at'])), 
-                np.array(camera_config['look_at'], dtype=np.float32), 
-                bc_type="periodic" if camera_config['look_at'][0] == camera_config['look_at'][-1] else "not-a-knot"
-            )
-            up = np.array(camera_config['up'], dtype=np.float32)
-        render_projection = utils3d.np.perspective_from_fov(fov_y=np.deg2rad(camera_config['fov']), near=0.01, far=np.inf, aspect_ratio=render_width / render_height)
-        
-        
-        def blended_eye_traj(frame_idx):
-            if frame_idx < transition_frames:
-                # Blend between computed and user trajectory
-                alpha = frame_idx / transition_frames  # 0 to 1
-                # Use spline interpolation for smooth computed trajectory
-                if eye_spline is not None:
-                    computed_eye = eye_spline(frame_idx)
-                else:
-                    computed_eye = smoothed_eye_positions[int(frame_idx)]
-                user_eye = user_eye_traj(frame_idx)
-                return computed_eye * (1 - alpha) + user_eye * alpha
+            # Determine eye position
+            if fixed_eye is not None:
+                eye_pos = np.array(fixed_eye, dtype=np.float32)
+                # If rescaling, adjust eye position relative to point cloud center
+                if rescale_pointcloud:
+                    # Rescale: (pos - center) * scale + center
+                    eye_pos = (eye_pos - point_cloud_center) * rescale_factor + point_cloud_center
             else:
-                # Use user trajectory after transition
-                return user_eye_traj(frame_idx)
-        
-        # Pre-compute all point cloud centers for smooth look_at trajectory
-        raw_look_at_centers = []
-        for idx in range(num_frames):
-            if accumulate_pc_interval > 0:
-                # Collect frame indices: current frame + previous frames every k frames
-                frame_indices = []
-                for prev_idx in range(0, idx + 1, accumulate_pc_interval):
-                    frame_indices.append(prev_idx)
-                # Always include current frame
-                if idx not in frame_indices:
-                    frame_indices.append(idx)
-                frame_indices.sort()
-                
-                # Collect all points from selected frames
-                all_points = []
-                for frame_idx_sel in frame_indices:
-                    frame_mask = prediction_frames[frame_idx_sel][1]
-                    frame_points = canonical_points_frames[frame_idx_sel][frame_mask]
-                    if len(frame_points) > 0:
-                        all_points.append(frame_points)
-                
+                # Compute default eye position: offset from point cloud center
+                # Calculate bounding box to determine a good viewing distance
                 if len(all_points) > 0:
-                    combined_points = np.concatenate(all_points, axis=0)
-                    center = combined_points.mean(axis=0)
+                    bbox_min = all_points.min(axis=0)
+                    bbox_max = all_points.max(axis=0)
+                    bbox_size = np.linalg.norm(bbox_max - bbox_min)
+                    # Place camera at a distance proportional to bbox size
+                    # After rescale, bbox_size should be approximately target_scale
+                    offset_distance = bbox_size * 0.5
+                    # Default view from negative Z direction (looking towards positive Z)
+                    # This matches the typical camera coordinate system where camera looks along -Z
+                    eye_pos = look_at_pos + np.array([0, -0.5, -offset_distance], dtype=np.float32)
                 else:
-                    # Fallback to global point cloud center
-                    all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
-                    center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
-            else:
-                # Only use current frame point cloud center
-                _, mask = prediction_frames[idx]
-                frame_points = canonical_points_frames[idx][mask]
+                    eye_pos = np.array([0, 0, -1], dtype=np.float32)
+            
+            up = np.array(fixed_up, dtype=np.float32)
+            render_projection = utils3d.np.perspective_from_fov(fov_y=np.deg2rad(fixed_fov), near=0.01, far=np.inf, aspect_ratio=render_width / render_height)
+            
+            # Create fixed view function
+            def fixed_eye_traj(frame_idx):
+                return eye_pos
+            
+            def fixed_look_at_traj(frame_idx):
+                return look_at_pos
+            
+            # Use fixed trajectory functions
+            blended_eye_traj = fixed_eye_traj
+            blended_look_at_traj = fixed_look_at_traj
+        
+        # Extract computed camera positions from poses (for trajectory mode)
+        # Note: pose_frames have already been rescaled if rescale_pointcloud is True
+        if camera_path is not None and not use_fixed_view:
+            computed_eye_positions = []
+            computed_look_at_positions = []
+            
+            for idx in range(num_frames):
+                pose, intrinsics = pose_frames[idx]
+                # Extract camera position (translation part of pose)
+                # This pose is already rescaled if rescale_pointcloud is True
+                eye_pos = pose[:3, 3]
+                computed_eye_positions.append(eye_pos)
+                
+                # Compute look_at position: use the center of visible points for this frame
+                # This ensures the camera looks at the scene it's observing
+                frame_points = canonical_points_frames[idx][prediction_frames[idx][1]]
                 if len(frame_points) > 0:
-                    center = frame_points.mean(axis=0)
+                    # Use center of visible points in this frame
+                    frame_center = frame_points.mean(axis=0)
+                    look_at_pos = frame_center
                 else:
-                    # Fallback to global point cloud center
-                    all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
-                    center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
-            raw_look_at_centers.append(center)
-        
-        raw_look_at_centers = np.array(raw_look_at_centers, dtype=np.float32)
-        
-        # Apply strong smoothing to look_at centers to reduce jitter
-        # Use larger window for look_at smoothing
-        smoothed_look_at_centers = smooth_trajectory(raw_look_at_centers, window_size=9)
-        
-        # Apply exponential moving average for additional smoothing
-        def exponential_smooth(positions, alpha=0.3):
-            """Apply exponential moving average for smoother transitions."""
-            if len(positions) < 2:
-                return positions
-            smoothed = np.zeros_like(positions)
-            smoothed[0] = positions[0]
-            for i in range(1, len(positions)):
-                smoothed[i] = alpha * positions[i] + (1 - alpha) * smoothed[i-1]
-            return smoothed
-        
-        # Apply exponential smoothing on top of moving average
-        smoothed_look_at_centers = exponential_smooth(smoothed_look_at_centers, alpha=0.4)
-        
-        # Create spline interpolation for smooth look_at trajectory
-        if num_frames > 3:
-            frame_indices = np.arange(num_frames, dtype=np.float32)
-            look_at_center_spline = CubicSpline(frame_indices, smoothed_look_at_centers, bc_type='natural')
-        else:
-            look_at_center_spline = None
-        
-        def blended_look_at_traj(frame_idx):
-            # Use spline-interpolated smoothed point cloud center as look_at target
-            if look_at_center_spline is not None:
-                return look_at_center_spline(frame_idx)
+                    # Fallback: use global point cloud center
+                    look_at_pos = point_cloud_center
+                
+                computed_look_at_positions.append(look_at_pos)
+            
+            computed_eye_positions = np.array(computed_eye_positions, dtype=np.float32)
+            computed_look_at_positions = np.array(computed_look_at_positions, dtype=np.float32)
+
+            # Smooth the computed camera trajectories to reduce jitter
+            def smooth_trajectory(positions, window_size=5):
+                """
+                Smooth trajectory using moving average with edge handling.
+                """
+                if len(positions) < 3:
+                    return positions
+                
+                smoothed = np.zeros_like(positions)
+                half_window = window_size // 2
+                
+                for i in range(len(positions)):
+                    # Determine window bounds
+                    start = max(0, i - half_window)
+                    end = min(len(positions), i + half_window + 1)
+                    
+                    # Use available points in window
+                    window = positions[start:end]
+                    smoothed[i] = window.mean(axis=0)
+                
+                return smoothed
+            
+            # Apply smoothing to camera positions and look_at positions
+            smoothed_eye_positions = smooth_trajectory(computed_eye_positions, window_size=5)
+            smoothed_look_at_positions = smooth_trajectory(computed_look_at_positions, window_size=5)
+            
+            # Create cubic spline interpolation for even smoother trajectories
+            if num_frames > 3:
+                frame_indices = np.arange(num_frames, dtype=np.float32)
+                eye_spline = CubicSpline(frame_indices, smoothed_eye_positions, bc_type='natural')
+                look_at_spline = CubicSpline(frame_indices, smoothed_look_at_positions, bc_type='natural')
             else:
-                return smoothed_look_at_centers[int(frame_idx)]
+                eye_spline = None
+                look_at_spline = None
+
+            # Create blended trajectory: start with computed trajectory, gradually transition to user trajectory
+            transition_frames = min(50, num_frames // 2)  # Transition over first 50 frames or 1/2 of video
+
+            # Load camera trajectory config first (for up vector, fov, and forward axis config)
+            with open(camera_path, 'r') as f:
+                camera_config = json.load(f)
+                camera_config['eye'][0] = computed_eye_positions[transition_frames].tolist()
+                camera_config['look_at'][0] = computed_look_at_positions[transition_frames].tolist()
+                user_eye_traj = CubicSpline(
+                    np.linspace(0, num_frames - 1, len(camera_config['eye'])), 
+                    np.array(camera_config['eye'], dtype=np.float32), 
+                    bc_type="periodic" if camera_config['eye'][0] == camera_config['eye'][-1] else "not-a-knot"
+                )
+                user_look_at_traj = CubicSpline(
+                    np.linspace(0, num_frames - 1, len(camera_config['look_at'])), 
+                    np.array(camera_config['look_at'], dtype=np.float32), 
+                    bc_type="periodic" if camera_config['look_at'][0] == camera_config['look_at'][-1] else "not-a-knot"
+                )
+                up = np.array(camera_config['up'], dtype=np.float32)
+            render_projection = utils3d.np.perspective_from_fov(fov_y=np.deg2rad(camera_config['fov']), near=0.01, far=np.inf, aspect_ratio=render_width / render_height)
+            
+            
+            def blended_eye_traj(frame_idx):
+                if frame_idx < transition_frames:
+                    # Blend between computed and user trajectory
+                    alpha = frame_idx / transition_frames  # 0 to 1
+                    # Use spline interpolation for smooth computed trajectory
+                    if eye_spline is not None:
+                        computed_eye = eye_spline(frame_idx)
+                    else:
+                        computed_eye = smoothed_eye_positions[int(frame_idx)]
+                    user_eye = user_eye_traj(frame_idx)
+                    return computed_eye * (1 - alpha) + user_eye * alpha
+                else:
+                    # Use user trajectory after transition
+                    return user_eye_traj(frame_idx)
+            
+            # Pre-compute all point cloud centers for smooth look_at trajectory
+            raw_look_at_centers = []
+            for idx in range(num_frames):
+                if accumulate_pc_interval > 0:
+                    # Collect frame indices: current frame + previous frames every k frames
+                    frame_indices = []
+                    for prev_idx in range(0, idx + 1, accumulate_pc_interval):
+                        frame_indices.append(prev_idx)
+                    # Always include current frame
+                    if idx not in frame_indices:
+                        frame_indices.append(idx)
+                    frame_indices.sort()
+                    
+                    # Collect all points from selected frames
+                    all_points = []
+                    for frame_idx_sel in frame_indices:
+                        frame_mask = prediction_frames[frame_idx_sel][1]
+                        frame_points = canonical_points_frames[frame_idx_sel][frame_mask]
+                        if len(frame_points) > 0:
+                            all_points.append(frame_points)
+                    
+                    if len(all_points) > 0:
+                        combined_points = np.concatenate(all_points, axis=0)
+                        center = combined_points.mean(axis=0)
+                    else:
+                        # Fallback to global point cloud center
+                        all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
+                        center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
+                else:
+                    # Only use current frame point cloud center
+                    _, mask = prediction_frames[idx]
+                    frame_points = canonical_points_frames[idx][mask]
+                    if len(frame_points) > 0:
+                        center = frame_points.mean(axis=0)
+                    else:
+                        # Fallback to global point cloud center
+                        all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
+                        center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
+                raw_look_at_centers.append(center)
+            
+            raw_look_at_centers = np.array(raw_look_at_centers, dtype=np.float32)
+            
+            # Apply strong smoothing to look_at centers to reduce jitter
+            # Use larger window for look_at smoothing
+            smoothed_look_at_centers = smooth_trajectory(raw_look_at_centers, window_size=9)
+            
+            # Apply exponential moving average for additional smoothing
+            def exponential_smooth(positions, alpha=0.3):
+                """Apply exponential moving average for smoother transitions."""
+                if len(positions) < 2:
+                    return positions
+                smoothed = np.zeros_like(positions)
+                smoothed[0] = positions[0]
+                for i in range(1, len(positions)):
+                    smoothed[i] = alpha * positions[i] + (1 - alpha) * smoothed[i-1]
+                return smoothed
+            
+            # Apply exponential smoothing on top of moving average
+            smoothed_look_at_centers = exponential_smooth(smoothed_look_at_centers, alpha=0.4)
+            
+            # Create spline interpolation for smooth look_at trajectory
+            if num_frames > 3:
+                frame_indices = np.arange(num_frames, dtype=np.float32)
+                look_at_center_spline = CubicSpline(frame_indices, smoothed_look_at_centers, bc_type='natural')
+            else:
+                look_at_center_spline = None
+            
+            def blended_look_at_traj(frame_idx):
+                # Use spline-interpolated smoothed point cloud center as look_at target
+                if look_at_center_spline is not None:
+                    return look_at_center_spline(frame_idx)
+                else:
+                    return smoothed_look_at_centers[int(frame_idx)]
 
         # Save input video
         Path(output_path, video_name, 'video').mkdir(exist_ok=True)
@@ -778,6 +873,19 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0, 0]
             return tuple(int(c) for c in bgr_color)
 
+        # Calculate frustum size based on point cloud scale
+        # Use a fraction of the point cloud bbox size for frustum visualization
+        # Note: all_points is already rescaled if rescale_pointcloud is True, so frustum size will be correct
+        if len(all_points) > 0:
+            bbox_min = all_points.min(axis=0)
+            bbox_max = all_points.max(axis=0)
+            bbox_size = np.linalg.norm(bbox_max - bbox_min)
+            # Use 2% of bbox size as frustum depth, with a minimum of 0.01
+            # This ensures frustum size scales with the point cloud (including rescale)
+            base_frustum_size = max(bbox_size * 0.02, 0.01)
+        else:
+            base_frustum_size = 0.1
+        
         # Render per-frame point cloud
         render_frames = []
         for idx in trange(num_frames, desc='Render'):
@@ -853,6 +961,7 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
             frustum_image_bgr = cv2.cvtColor(frustum_image, cv2.COLOR_RGB2BGR)
             
             # Draw all historical camera frustums (from frame 0 to current frame)
+            # Note: hist_pose is already rescaled if rescale_pointcloud is True
             for hist_idx in range(idx + 1):
                 hist_pose, hist_intrinsics = pose_frames[hist_idx]
                 hist_extrinsics = np.linalg.inv(hist_pose)
@@ -861,17 +970,23 @@ def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_s
                 camera_color_bgr = get_camera_color(hist_idx, num_frames)
                 
                 # Create camera frustum mesh
-                camera_vertices, camera_edges, _ = utils3d.np.create_camera_frustum_mesh(hist_extrinsics, hist_intrinsics, 0.1)
+                # Use base_frustum_size calculated from rescaled point cloud scale
+                # hist_pose is already rescaled, so camera frustum will be correctly positioned and sized
+                camera_vertices, camera_edges, _ = utils3d.np.create_camera_frustum_mesh(hist_extrinsics, hist_intrinsics, base_frustum_size)
+                
+                # Transform vertices from camera space to world space (if needed)
+                # create_camera_frustum_mesh may return vertices in camera space, so transform to world space using pose
+                vertices_world = utils3d.np.transform_points(camera_vertices, hist_pose)
                 
                 # Transform vertices to clip space
-                vertices_homogeneous = np.concatenate([camera_vertices, np.ones((camera_vertices.shape[0], 1), dtype=np.float32)], axis=1)
+                vertices_homogeneous = np.concatenate([vertices_world, np.ones((vertices_world.shape[0], 1), dtype=np.float32)], axis=1)
                 vertices_clip = (render_projection @ render_view @ vertices_homogeneous.T).T
                 
                 # Perspective divide
                 vertices_ndc = vertices_clip[:, :3] / (vertices_clip[:, 3:4] + 1e-8)
                 
                 # Convert to screen coordinates
-                vertices_screen = np.zeros((camera_vertices.shape[0], 2), dtype=np.int32)
+                vertices_screen = np.zeros((vertices_world.shape[0], 2), dtype=np.int32)
                 vertices_screen[:, 0] = ((vertices_ndc[:, 0] + 1) * 0.5 * render_width).astype(np.int32)
                 vertices_screen[:, 1] = ((1 - vertices_ndc[:, 1]) * 0.5 * render_height).astype(np.int32)
                 
