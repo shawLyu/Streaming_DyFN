@@ -16,15 +16,13 @@ import numpy as np
 from tqdm import tqdm
 from decord import VideoReader, cpu
 import torch.nn.functional as F
-from sklearn.linear_model import RANSACRegressor, LinearRegression
 
 from moge.model.v1 import MoGeModel
 from moge.utils.io import save_ply
 from moge.utils.vis import colorize_depth_video
 from moge.utils.alignment import align_depth_affine
 from moge.utils.geometry_torch import mask_aware_nearest_resize
-from moge.video_benchmark.eval.metric import *
-import moge.video_benchmark.eval.metric as metric
+import moge.utils.metric as metric
 
 eval_metrics = [
     "abs_relative_difference",

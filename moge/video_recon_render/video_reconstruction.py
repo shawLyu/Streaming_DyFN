@@ -38,19 +38,40 @@ def read_frames(path: Union[str, Path], start: int = None, end: int = None,
     path = Path(path)
     frames = []
     
-    if path.is_file():
-        # Video file handling
-        cap = cv2.VideoCapture(str(path))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    best_score, best_inlines = 0., np.zeros(n, dtype=bool)
+    best_solution = np.eye(4, dtype=np.float32)
+
+    for _ in range(max_iters):
+        maybe_inliers = np.random.choice(n, size=hypothetical_size, replace=False)
+        try:
+            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='affine')
+        except np.linalg.LinAlgError:
+            continue
+        transformed_p = utils3d.np.transform_points(p, pose)
+        errors = w * np.linalg.norm(transformed_p - q, axis=1)
+        inliers = errors < inlier_thresh
         
-        # Calculate resize dimensions
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if target_size:
-            scale = target_size / max(width, height)
-            target_w, target_h = int(width * scale), int(height * scale)
-        else:
-            target_w, target_h = width, height
+        score = inlier_thresh * n - np.clip(errors, None, inlier_thresh).sum()
+        if score > best_score:
+            best_score, best_inlines = score, inliers
+            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='affine')
+    
+    return best_solution, best_inlines
+
+
+def extract_corresponding_pixels(flow, mask_shape):
+    h, w = mask_shape[:2]
+    grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+    corresponding_x = (grid_x + flow[..., 0]).astype(int)
+    corresponding_y = (grid_y + flow[..., 1]).astype(int)
+
+    valid_mask = (corresponding_x >= 0) & (corresponding_x < w) & (corresponding_y >= 0) & (corresponding_y < h)
+    return valid_mask, corresponding_x, corresponding_y
+
+
+def read_frames_from_video(video_path, start: int = None, end: int = None, skip: int = None,target_size: Union[int, Tuple[int, int]] = None):
+    cap = cv2.VideoCapture(video_path)
+    frames = []
 
         if start is not None:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start)
@@ -298,7 +319,10 @@ class SceneReconstructor:
 
             # 2. Pose Estimation (Registration)
             if i_curr == 0:
-                pose = np.eye(4, dtype=np.float32)
+                # For the first frame, just normalize the scale and set identity pose
+                pose = np.mean(1 / curr_points[curr_mask, 2]) * np.eye(4, dtype=np.float32)
+                # pose = np.eye(4, dtype=np.float32)
+                inlier_mask = np.zeros_like(curr_mask, dtype=bool)
             else:
                 ref_indices = [i_curr - k for k in ref_offsets if i_curr - k >= 0]
                 p_list, q_list, w_list = [], [], []

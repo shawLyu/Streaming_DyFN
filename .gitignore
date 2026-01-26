@@ -433,3 +433,5 @@ datasets*
 video_benchmark/
 exps/
 pretrained/
+video_results/
+eval_results/
