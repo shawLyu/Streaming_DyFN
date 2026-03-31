@@ -65,7 +65,6 @@ def read_video_frames(video_path, target_fps, max_res, silent=False):
 
 
 @click.command(help='Evaluate video results')
-# @click.option('--eval_dataset_list', type=list[str], default=['sintel', 'scannet', 'KITTI', 'bonn', 'NYUv2'], help='List of datasets to evaluate')
 @click.option('--eval_dataset_list', type=list[str], default=['sintel', 'scannet', 'KITTI', 'bonn'], help='List of datasets to evaluate')
 @click.option('--video_dir_path', type=click.Path(exists=True), required=True, help='Path to evaluated video file')
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='Ruicheng/moge-vitl', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')

@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "moge"
+name = "DyFN"
 version = "1.0.0"
-description = "MoGe: Unlocking Accurate Monocular Geometry Estimation for Open-Domain Images with Optimal Training Supervision"
+description = "Stabilizing Streaming Video Geometry via Dynamic Feature Normalization"
 readme = "README.md"
 license = {text = "MIT"}
 dependencies = [
@@ -20,16 +20,16 @@ dependencies = [
     "torch>=2.0.0",
     "torchvision",
     "gradio",
-    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3913c65d81e05e47b9f367250cf8c0f7462a0900"
+    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git"
 ]
 requires-python = ">=3.9"
 
 [project.urls]
-Homepage = "https://github.com/microsoft/MoGe"
+Homepage = "https://github.com/shawLyu/DyFN.git"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["moge*"]
+include = ["DyFN*"]
 
 [project.scripts]
-moge = "moge.scripts.cli:main"
+DyFN = "DyFN.scripts.cli:main"

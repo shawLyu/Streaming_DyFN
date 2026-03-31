@@ -7,7 +7,6 @@ import warnings
 import json
 
 from tqdm import tqdm
-from einops import rearrange
 
 import torch
 import torch.nn as nn
@@ -312,7 +311,7 @@ class MoGeModel(nn.Module):
         if model_kwargs is not None:
             model_config.update(model_kwargs)
         model = cls(**model_config)
-        model.load_state_dict(checkpoint['model'])
+        model.load_state_dict(checkpoint['model'], strict=False)
         return model
 
     def init_weights(self):

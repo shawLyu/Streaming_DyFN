@@ -97,7 +97,7 @@ def normalize_svd(svd_img, vmin, vmax):
 @click.command(help='Video Depth Inference Demo')
 @click.option('--video_path', type=click.Path(exists=True), required=True, help='Path to input video file')
 @click.option('--fov_x', 'fov_x_', type=float, default=None, help='If camera parameters are known, set the horizontal field of view in degrees. Otherwise, MoGe will estimate it.')
-@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='shawlyu/StreamingMoGE', help='Pretrained model name or path. Defaults to "Ruicheng/moge-vitl"')
+@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default='shawlyu/StreamingMoGE', help='Pretrained model name or path. Defaults to "shawlyu/StreamingMoGE"')
 @click.option('--output_dir', type=click.Path(), default='outputs', help='Directory to save output results')
 @click.option('--save_video', is_flag=True, help='Save output as video')
 @click.option('--target_fps', type=int, default=15, help='Target frames per second for video processing')
@@ -115,11 +115,9 @@ Defaults to 9. Note that it is irrelevant to the output size, which is always th
 @click.option('--save_ply_', is_flag=True, help='Save the output as a ply file.')
 @click.option('--save_frames_', is_flag=True, help='Save the perframe information')
 @click.option('--threshold', type=float, default=0.03, help='Threshold for removing edges. Defaults to 0.03. Smaller value removes more edges. "inf" means no thresholding.')
-@click.option('--vis_feature', is_flag=True, help='Visualize the feature map.')
 @click.option('--vis_normal', is_flag=True, help='Visualize the normal map.')
 @click.option('--depth_show', is_flag=True, help='Show the depth map.')
 @click.option('--image_based', is_flag=True, help='Use image-based inference.')
-@click.option('--ema_only', is_flag=True, help='Only use the EMA model for inference.')
 def main(
     video_path: str,
     fov_x_: float,
@@ -137,15 +135,11 @@ def main(
     save_ply_: bool,
     save_frames_: bool,
     threshold: float,
-    vis_feature: bool,
     vis_normal: bool,
     depth_show: bool,
     image_based: bool,
-    ema_only: bool,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    assert not (image_based and ema_only), "Image-based inference and EMA-only inference cannot be used together."
 
     # frames: [n, h, w, 3], np.array
     frames, fps = read_video_frames(video_path, target_fps, max_res)
@@ -160,7 +154,7 @@ def main(
         # Use sliding window of size 3 with stride 1
         image_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).to(device)
         output = model.infer_video(image_tensor, fov_x=fov_x_, resolution_level=resolution_level, 
-                                   num_tokens=num_tokens, use_fp16=use_fp16, image_based=image_based, ema_only=ema_only)
+                                   num_tokens=num_tokens, use_fp16=use_fp16, image_based=image_based)
 
         points = output['points'].cpu().numpy()
         depth = output['depth'].cpu().numpy()
@@ -175,11 +169,11 @@ def main(
             disp_preds = depth
         else:
             disp_preds = 1 / depth
-        # disp_preds = depth
 
-        frames_output_dir = Path(output_dir, "frames")
-        save_path = Path(frames_output_dir, Path(video_path).stem)
-        save_path.mkdir(exist_ok=True, parents=True)
+        video_name = Path(video_path).stem
+        output_dir = Path(output_dir, video_name)
+        frames_save_path = output_dir / "frames" / video_name if save_frames_ else None
+        ply_save_path = output_dir / "ply" / video_name if save_ply_ else None
 
         min_disp, max_disp = np.nanquantile(disp_preds, 0.02), np.nanquantile(disp_preds, 0.98)
         disp_preds = np.clip(disp_preds, min_disp, max_disp)
@@ -187,6 +181,8 @@ def main(
 
     if vis_normal:
         print("==> visualizing normal maps")
+        if save_path is not None:
+            save_path.mkdir(exist_ok=True, parents=True)
         normals_list = []
         for i, frame in tqdm(enumerate(frames), total=len(frames), desc="Processing saved frames"):
             normals, normals_mask = utils3d.numpy.points_to_normals(points[i], mask=mask[i])
@@ -203,7 +199,7 @@ def main(
                 # - world coordinate system: x right, y up, z backward.
                 # - texture coordinate system: (0, 0) for left-bottom, (1, 1) for right-top.
                 vertices, vertex_uvs = vertices * [1, -1, -1], vertex_uvs * [1, -1] + [0, 1]
-                save_ply(save_path/f"{i:05d}.ply", vertices, faces, vertex_colors)
+                save_ply(save_path / f"{i:05d}.ply", vertices, faces, vertex_colors)
             if save_frames_:
                 cv2.imwrite(str(save_path / f'image_{i:05d}.jpg'), cv2.cvtColor(frame * 255, cv2.COLOR_RGB2BGR))
                 cv2.imwrite(str(save_path / f'depth_vis_{i:05d}.png'), cv2.cvtColor(colorize_depth(depth[i]), cv2.COLOR_RGB2BGR))
@@ -219,40 +215,6 @@ def main(
                     }, f)
         normals = np.stack(normals_list, axis=0)
 
-
-    if vis_feature:
-        print("==> visualizing feature maps")
-        frames_np = (frames * 255).astype(np.uint8)
-        prev_uh_before = None
-        prev_uh_after = None
-        for feat_before, feat_after in zip(feature_before_temporal_attention, feature_after_temporal_attention):
-            feat_before_svd, prev_uh_before = compute_svd_raw(feat_before, prev_uh_before)
-            feat_after_svd, prev_uh_after = compute_svd_raw(feat_after, prev_uh_after)
-            feats_before_svd.append(feat_before_svd)
-            feats_after_svd.append(feat_after_svd)
-        
-        global_min_before_svd = min(arr.min() for arr in feats_before_svd)
-        global_max_before_svd = max(arr.max() for arr in feats_before_svd)
-        global_min_after_svd = min(arr.min() for arr in feats_after_svd)
-        global_max_after_svd = max(arr.max() for arr in feats_after_svd)
-
-        feats_before_svd = [normalize_svd(arr, global_min_before_svd, global_max_before_svd) for arr in feats_before_svd]
-        feats_after_svd = [normalize_svd(arr, global_min_after_svd, global_max_after_svd) for arr in feats_after_svd]
-        feats_vis_before = []
-        for arr in feats_before_svd:
-            # arr: [C, H, W], take first 3 channels, normalize to [0,255]
-            arr_vis = cv2.resize(arr, (frames_np.shape[2], frames_np.shape[1]))
-            arr_vis = (arr_vis * 255).clip(0, 255).astype(np.uint8)
-            feats_vis_before.append(arr_vis)
-        feats_vis_before = np.stack(feats_vis_before, axis=0)
-
-        feats_vis_after = []
-        for arr in feats_after_svd:
-            arr_vis = cv2.resize(arr, (frames_np.shape[2], frames_np.shape[1]))
-            arr_vis = (arr_vis * 255).clip(0, 255).astype(np.uint8)
-            feats_vis_after.append(arr_vis)
-        feats_vis_after = np.stack(feats_vis_after, axis=0)
-
     if save_video:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         # Prepare visualizations
@@ -261,26 +223,16 @@ def main(
         if vis_normal:
             # 1x3 grid: [frame | depth | normal]
             grid_video = np.concatenate([frames_np, depth_preds_color, normals], axis=2)
-        elif vis_feature:
-            # 2x2 grid: [frame | depth]
-            #           [feats_after| feats_before]
-            top_row = np.concatenate([frames_np, depth_preds_color], axis=2)
-            bottom_row = np.concatenate([feats_vis_after, feats_vis_before], axis=2)
-            grid_video = np.concatenate([top_row, bottom_row], axis=1)
         else:
             grid_video = np.concatenate([frames_np, depth_preds_color], axis=2)
 
         video_name = Path(video_path).stem
         if image_based:
             output_path = os.path.join(output_dir, f'{video_name}_image_based_depth.mp4')
-        elif ema_only:
-            output_path = os.path.join(output_dir, f'{video_name}_ema_only_depth.mp4')
         else:
             output_path = os.path.join(output_dir, f'{video_name}_depth.mp4')
         if vis_normal:
             output_path = output_path.replace('.mp4', '_w_normal.mp4')
-        elif vis_feature:
-            output_path = output_path.replace('.mp4', '_w_feature.mp4')
         mediapy.write_video(output_path, grid_video, fps=target_fps, crf=18)
 if __name__ == '__main__':
     main()
