@@ -42,9 +42,12 @@ python moge/scripts/infer_video.py --video_path videos/jump.mp4 --save_video
 ## Pretrained Models
 
 ## Evaluation
+Detailed evaluation instructions are available in [docs/eval.md](docs/eval.md).
+
 ### Video Evaluation
 ### Image Evaluation
 
 ## Training
 
-## Data
+## Data Processing
+Detailed data preparation and processing instructions are available in [docs/train.md](docs/train.md#data-preparation).
