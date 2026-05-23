@@ -419,9 +419,9 @@ class SceneReconstructor:
 
             # 2. Pose Estimation (Registration)
             if i_curr == 0:
-                # For the first frame, just normalize the scale and set identity pose
-                pose = np.mean(1 / curr_points[curr_mask, 2]) * np.eye(4, dtype=np.float32)
-                # pose = np.eye(4, dtype=np.float32)
+                # Keep the first frame in the model's native scale. Later
+                # frames are registered rigidly into this coordinate frame.
+                pose = np.eye(4, dtype=np.float32)
                 inlier_mask = np.zeros_like(curr_mask, dtype=bool)
             else:
                 ref_indices = [i_curr - k for k in ref_offsets if i_curr - k >= 0]
@@ -619,7 +619,9 @@ def render_sequence(scene: SceneReconstructor,
                    target_scale: float = 1.0,
                    camera_distance: float = 1.35,
                    camera_height: float = 0.15,
-                   render_point_size: int = 1):
+                   render_point_size: int = 1,
+                   pullback_frames: int = 0,
+                   pullback_distance: float = 3.0):
     
     print("Rendering Video...")
     num_frames = len(scene.images)
@@ -664,16 +666,32 @@ def render_sequence(scene: SceneReconstructor,
     )
     
     rendered_frames = []
+    total_render_frames = num_frames + max(pullback_frames, 0)
+    final_eye = get_eye(num_frames - 1)
+    final_look = get_look(num_frames - 1)
+    pullback_direction = final_eye - final_look
+    pullback_direction = pullback_direction / (np.linalg.norm(pullback_direction) + 1e-8)
+    final_pullback_eye = final_eye + pullback_direction * bbox_size * pullback_distance
     
-    for i in trange(num_frames, desc='Rendering'):
+    for render_idx in trange(total_render_frames, desc='Rendering'):
         # Determine camera for this frame
-        view = utils3d.numpy.view_look_at(get_eye(i), get_look(i), up_vec).astype(np.float32)
+        if render_idx < num_frames:
+            source_idx = render_idx
+            eye = get_eye(source_idx)
+            look = get_look(source_idx)
+        else:
+            source_idx = num_frames - 1
+            alpha = (render_idx - num_frames + 1) / max(pullback_frames, 1)
+            alpha = 0.5 - 0.5 * np.cos(np.pi * alpha)
+            eye = (1 - alpha) * final_eye + alpha * final_pullback_eye
+            look = final_look
+        view = utils3d.numpy.view_look_at(eye, look, up_vec).astype(np.float32)
         
         # Gather points to render (current + accumulated history)
         if accumulate_interval <= 0:
-            indices = list(range(i + 1))
+            indices = list(range(source_idx + 1))
         else:
-            indices = sorted(list(set([i] + list(range(0, i + 1, accumulate_interval)))))
+            indices = sorted(list(set([source_idx] + list(range(0, source_idx + 1, accumulate_interval)))))
             
         render_pts = []
         render_cols = []
@@ -699,7 +717,7 @@ def render_sequence(scene: SceneReconstructor,
         
         # Draw Frustums
         frustum_size = max(bbox_size * 0.02, 0.05) if rescale else 0.1
-        img_final = draw_frustums(img_render, i, scene.poses, scene.intrinsics, view, proj, frustum_size)
+        img_final = draw_frustums(img_render, source_idx, scene.poses, scene.intrinsics, view, proj, frustum_size)
         
         rendered_frames.append(img_final.astype(np.uint8))
         
@@ -728,9 +746,11 @@ def render_sequence(scene: SceneReconstructor,
 @click.option('--camera-distance', type=float, default=1.35, help='Multiplier that moves the render camera farther from the look-at point.')
 @click.option('--camera-height', type=float, default=0.15, help='Camera height offset as a fraction of the scene bounding-box diagonal.')
 @click.option('--render-point-size', type=int, default=1, help='Rendered point splat size in pixels. Use 1 for the finest point cloud.')
+@click.option('--pullback-frames', type=int, default=0, help='Append this many frames after trajectory following to pull backward and show the full scene.')
+@click.option('--pullback-distance', type=float, default=3.0, help='Backward pull-out distance as a fraction of the scene bounding-box diagonal.')
 @click.option('--use-cache/--no-use-cache', default=None, help='Use existing cached reconstruction results without prompting.')
 @click.option('--rescale', is_flag=True, help='Normalize point cloud scale for visualization. Leave unset to render reconstructed scale.')
-def main(video_path, output_path, pretrained, fov_x, input_size, start, end, skip, fps, voxel_size, accumulate_interval, camera_distance, camera_height, render_point_size, use_cache, rescale):
+def main(video_path, output_path, pretrained, fov_x, input_size, start, end, skip, fps, voxel_size, accumulate_interval, camera_distance, camera_height, render_point_size, pullback_frames, pullback_distance, use_cache, rescale):
     
     # 1. Setup
     video_path = Path(video_path)
@@ -776,6 +796,8 @@ def main(video_path, output_path, pretrained, fov_x, input_size, start, end, ski
         camera_distance=camera_distance,
         camera_height=camera_height,
         render_point_size=render_point_size,
+        pullback_frames=pullback_frames,
+        pullback_distance=pullback_distance,
     )
     
     print(f"Processing complete. Results saved to {scene.output_dir}")
