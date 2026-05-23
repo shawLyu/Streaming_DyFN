@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import itertools
+import subprocess
 from pathlib import Path
 from typing import *
 
@@ -28,6 +29,89 @@ from third_party_models import pdcnet
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+def apply_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Apply a 4x4 homogeneous transform to an (..., 3) point array."""
+    original_shape = points.shape
+    points_flat = points.reshape(-1, 3)
+    points_h = np.concatenate([points_flat, np.ones((points_flat.shape[0], 1), dtype=points.dtype)], axis=1)
+    transformed = (transform @ points_h.T).T[:, :3]
+    return transformed.reshape(original_shape)
+
+
+def solve_pose_rigid(p: np.ndarray, q: np.ndarray, w: np.ndarray = None) -> np.ndarray:
+    """Weighted rigid alignment from source points p to target points q."""
+    if w is None:
+        w = np.ones(p.shape[0], dtype=np.float32)
+    w = np.asarray(w, dtype=np.float64)
+    w = np.maximum(w, 1e-8)
+    w = w / w.sum()
+    p64, q64 = p.astype(np.float64), q.astype(np.float64)
+    p_center = (p64 * w[:, None]).sum(axis=0)
+    q_center = (q64 * w[:, None]).sum(axis=0)
+    p0, q0 = p64 - p_center, q64 - q_center
+    covariance = (p0 * w[:, None]).T @ q0
+    u, _, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:
+        vt[-1] *= -1
+        rotation = vt.T @ u.T
+    translation = q_center - rotation @ p_center
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = rotation.astype(np.float32)
+    pose[:3, 3] = translation.astype(np.float32)
+    return pose
+
+
+def camera_frustum_mesh(intrinsics: np.ndarray, frustum_scale: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Create a lightweight camera frustum wireframe in camera coordinates."""
+    if intrinsics.shape == (4, 4):
+        intrinsics = intrinsics[:3, :3]
+    fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
+    cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
+    corners = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=np.float32)
+    rays = np.stack([(corners[:, 0] - cx) / fx, (corners[:, 1] - cy) / fy, np.ones(4)], axis=1)
+    rays = rays / (np.linalg.norm(rays, axis=1, keepdims=True) + 1e-8) * frustum_scale
+    verts = np.concatenate([np.zeros((1, 3), dtype=np.float32), rays.astype(np.float32)], axis=0)
+    edges = np.array([[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 3], [3, 4], [4, 1]], dtype=np.int32)
+    return verts, edges
+
+
+def rasterize_point_cloud_simple(
+    image_size: Tuple[int, int],
+    points: np.ndarray,
+    attributes: np.ndarray,
+    view: np.ndarray,
+    projection: np.ndarray,
+    point_size: int = 1,
+) -> Dict[str, np.ndarray]:
+    """Small CPU point renderer used only for reconstruction preview videos."""
+    height, width = image_size
+    image = np.ones((height, width, 3), dtype=np.uint8) * 255
+    mask = np.zeros((height, width), dtype=bool)
+    depth = np.full((height, width), np.inf, dtype=np.float32)
+    points_h = np.concatenate([points, np.ones((points.shape[0], 1), dtype=points.dtype)], axis=1)
+    clip = (projection @ view @ points_h.T).T
+    valid_w = np.abs(clip[:, 3]) > 1e-8
+    ndc = clip[:, :3] / (clip[:, 3:4] + 1e-8)
+    valid = valid_w & np.all(np.isfinite(ndc), axis=1) & (ndc[:, 2] > -1) & (ndc[:, 2] < 1)
+    xy = np.empty((points.shape[0], 2), dtype=np.int32)
+    xy[:, 0] = ((ndc[:, 0] + 1) * 0.5 * width).astype(np.int32)
+    xy[:, 1] = ((1 - ndc[:, 1]) * 0.5 * height).astype(np.int32)
+    valid &= (xy[:, 0] >= 0) & (xy[:, 0] < width) & (xy[:, 1] >= 0) & (xy[:, 1] < height)
+    radius = max((int(point_size) - 1) // 2, 0)
+    for (x, y), z, color in zip(xy[valid], ndc[valid, 2], attributes[valid]):
+        x0, x1 = max(x - radius, 0), min(x + radius + 1, width)
+        y0, y1 = max(y - radius, 0), min(y + radius + 1, height)
+        patch = depth[y0:y1, x0:x1]
+        closer = z < patch
+        if np.any(closer):
+            patch[closer] = z
+            image_patch = image[y0:y1, x0:x1]
+            image_patch[closer] = np.clip(color, 0, 255).astype(np.uint8)
+            mask[y0:y1, x0:x1][closer] = True
+    return {"image": image, "mask": mask, "depth": depth}
+
+
 # ==============================================================================
 #                               IO UTILITIES
 # ==============================================================================
@@ -38,41 +122,20 @@ def read_frames(path: Union[str, Path], start: int = None, end: int = None,
     path = Path(path)
     frames = []
     
-    best_score, best_inlines = 0., np.zeros(n, dtype=bool)
-    best_solution = np.eye(4, dtype=np.float32)
-
-    for _ in range(max_iters):
-        maybe_inliers = np.random.choice(n, size=hypothetical_size, replace=False)
-        try:
-            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='affine')
-        except np.linalg.LinAlgError:
-            continue
-        transformed_p = utils3d.np.transform_points(p, pose)
-        errors = w * np.linalg.norm(transformed_p - q, axis=1)
-        inliers = errors < inlier_thresh
-        
-        score = inlier_thresh * n - np.clip(errors, None, inlier_thresh).sum()
-        if score > best_score:
-            best_score, best_inlines = score, inliers
-            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='affine')
-    
-    return best_solution, best_inlines
-
-
-def extract_corresponding_pixels(flow, mask_shape):
-    h, w = mask_shape[:2]
-    grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
-    corresponding_x = (grid_x + flow[..., 0]).astype(int)
-    corresponding_y = (grid_y + flow[..., 1]).astype(int)
-
-    valid_mask = (corresponding_x >= 0) & (corresponding_x < w) & (corresponding_y >= 0) & (corresponding_y < h)
-    return valid_mask, corresponding_x, corresponding_y
-
-
-def read_frames_from_video(video_path, start: int = None, end: int = None, skip: int = None,target_size: Union[int, Tuple[int, int]] = None):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-
+    if path.is_file():
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {path}")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if target_size:
+            scale = target_size / max(original_width, original_height)
+            target_w = int(round(original_width * scale))
+            target_h = int(round(original_height * scale))
+        else:
+            target_w, target_h = original_width, original_height
+        skip = max(skip or 1, 1)
         if start is not None:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start)
             
@@ -92,10 +155,11 @@ def read_frames_from_video(video_path, start: int = None, end: int = None, skip:
             current_idx += 1
             pbar.update(1)
         cap.release()
+        pbar.close()
         
     elif path.is_dir():
         # Image folder handling
-        image_paths = sorted(path.glob('*.jpg'))[start:end:skip]
+        image_paths = sorted(itertools.chain(path.glob('*.jpg'), path.glob('*.png')))[start:end:skip]
         for p in tqdm(image_paths, desc='Reading Frames'):
             img = cv2.imread(str(p))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -110,16 +174,51 @@ def read_frames_from_video(video_path, start: int = None, end: int = None, skip:
         
     return frames
 
+
+def extract_corresponding_pixels(flow, mask_shape):
+    h, w = mask_shape[:2]
+    grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+    corresponding_x = (grid_x + flow[..., 0]).astype(int)
+    corresponding_y = (grid_y + flow[..., 1]).astype(int)
+
+    valid_mask = (corresponding_x >= 0) & (corresponding_x < w) & (corresponding_y >= 0) & (corresponding_y < h)
+    return valid_mask, corresponding_x, corresponding_y
+
 def write_video(path: Union[str, Path], frames: List[np.ndarray], fps: int = 24):
     """Writes a list of RGB numpy arrays to an MP4 video."""
     if not frames:
         return
+    path = Path(path)
     h, w = frames[0].shape[:2]
+    tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video = cv2.VideoWriter(str(path), fourcc, fps, (w, h))
+    video = cv2.VideoWriter(str(tmp_path), fourcc, fps, (w, h))
     for frame in frames:
         video.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     video.release()
+
+    try:
+        subprocess.run(
+            [
+                'ffmpeg',
+                '-y',
+                '-loglevel',
+                'error',
+                '-i',
+                str(tmp_path),
+                '-c:v',
+                'libx264',
+                '-pix_fmt',
+                'yuv420p',
+                '-movflags',
+                '+faststart',
+                str(path),
+            ],
+            check=True,
+        )
+        tmp_path.unlink(missing_ok=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        os.replace(tmp_path, path)
 
 def write_ply(path: Union[str, Path], points: np.ndarray, colors: np.ndarray = None):
     """Writes point cloud to PLY using Open3D."""
@@ -153,12 +252,12 @@ def solve_pose_ransac(p: np.ndarray, q: np.ndarray, w: np.ndarray = None,
         # Sample random points
         maybe_indices = np.random.choice(n, size=hypothetical_size, replace=False)
         try:
-            pose = utils3d.np.solve_pose(p[maybe_indices], q[maybe_indices], w[maybe_indices], mode='rigid')
+            pose = solve_pose_rigid(p[maybe_indices], q[maybe_indices], w[maybe_indices])
         except np.linalg.LinAlgError:
             continue
             
         # Verify model
-        transformed_p = utils3d.np.transform_points(p, pose)
+        transformed_p = apply_transform(p, pose)
         errors = w * np.linalg.norm(transformed_p - q, axis=1)
         inliers = errors < inlier_thresh
         
@@ -170,7 +269,7 @@ def solve_pose_ransac(p: np.ndarray, q: np.ndarray, w: np.ndarray = None,
             best_inliers = inliers
             # Refine pose with all inliers
             if inliers.sum() > 3:
-                best_pose = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='rigid')
+                best_pose = solve_pose_rigid(p[inliers], q[inliers], w[inliers])
     
     return best_pose, best_inliers
 
@@ -188,11 +287,11 @@ def get_correspondence_pdcnet(model, img_ref, mask_ref, img_query, mask_query):
     confidence = confidence.cpu().numpy()
     
     # Map coordinates
-    uv_ref = utils3d.np.uv_map(h, w)
+    uv_ref = utils3d.numpy.image_uv(height=h, width=w)
     uv_tgt = uv_ref + flow
     
-    pix_ref = utils3d.np.uv_to_pixel(uv_ref, (h, w)).round().astype(int)
-    pix_tgt = utils3d.np.uv_to_pixel(uv_tgt, (h, w)).round().astype(int)
+    pix_ref = utils3d.numpy.uv_to_pixel(uv_ref, width=w, height=h).round().astype(int)
+    pix_tgt = utils3d.numpy.uv_to_pixel(uv_tgt, width=w, height=h).round().astype(int)
     
     # Filter valid matches
     # 1. Confidence threshold
@@ -245,7 +344,7 @@ class SceneReconstructor:
 
     def load_cached_results(self, frames: List[np.ndarray]):
         """Loads pre-calculated results from disk, skipping inference."""
-        self.images = frames
+        self.images = []
         files = sorted(self.result_dir.glob('*_points.exr'))
         
         if len(files) == 0:
@@ -279,9 +378,10 @@ class SceneReconstructor:
             intrinsics = cam_data['intrinsics']
             
             # Reconstruct world points
-            pts_world = utils3d.np.transform_points(pts, pose)
+            pts_world = apply_transform(pts, pose)
             
             # Store
+            self.images.append(frames[idx])
             self.points_local.append(pts)
             self.masks.append(mask)
             self.points_world.append(pts_world)
@@ -315,7 +415,7 @@ class SceneReconstructor:
             prev_state = output['prev_state']
             
             # Clean mask based on depth edges
-            curr_mask &= ~utils3d.np.depth_map_edge(curr_points[:, :, 2], rtol=0.05, mask=curr_mask)
+            curr_mask &= ~utils3d.numpy.depth_edge(curr_points[:, :, 2], rtol=0.05, mask=curr_mask)
 
             # 2. Pose Estimation (Registration)
             if i_curr == 0:
@@ -346,7 +446,7 @@ class SceneReconstructor:
                     pose = self.poses[-1]
 
             # 3. Store & Save
-            curr_points_world = utils3d.np.transform_points(curr_points, pose)
+            curr_points_world = apply_transform(curr_points, pose)
             
             self.masks.append(curr_mask)
             self.points_local.append(curr_points)
@@ -407,7 +507,9 @@ class SceneReconstructor:
 def compute_smooth_trajectory(poses: List[np.ndarray], 
                             points_world_frames: List[np.ndarray], 
                             masks: List[np.ndarray],
-                            accumulate_interval: int = 0) -> Tuple[Callable, Callable]:
+                            accumulate_interval: int = 0,
+                            camera_distance: float = 1.35,
+                            camera_height: float = 0.0) -> Tuple[Callable, Callable]:
     """
     Computes a smooth camera path (Eye and LookAt) using cubic splines.
     Returns two functions: get_eye(t) and get_look_at(t).
@@ -423,8 +525,9 @@ def compute_smooth_trajectory(poses: List[np.ndarray],
     
     for i in range(num_frames):
         # Determine valid points for this frame (local or accumulated)
-        indices = [i]
-        if accumulate_interval > 0:
+        if accumulate_interval <= 0:
+            indices = list(range(i + 1))
+        else:
             indices = sorted(list(set([i] + list(range(0, i + 1, accumulate_interval)))))
         
         valid_pts = []
@@ -451,6 +554,8 @@ def compute_smooth_trajectory(poses: List[np.ndarray],
 
     smooth_eyes = smooth_arr(raw_eyes, 5)
     smooth_look_ats = smooth_arr(raw_look_ats, 9)
+    smooth_eyes = smooth_look_ats + (smooth_eyes - smooth_look_ats) * camera_distance
+    smooth_eyes = smooth_eyes + np.array([0.0, -camera_height, 0.0], dtype=np.float32)
 
     # 3. Create Splines
     t = np.arange(num_frames)
@@ -482,8 +587,8 @@ def draw_frustums(image: np.ndarray,
         color_rgb = cv2.cvtColor(color_hsv, cv2.COLOR_HSV2RGB)[0, 0].tolist()
         
         # Get Frustum Geometry
-        verts, edges, _ = utils3d.np.create_camera_frustum_mesh(extrinsics, intr, frustum_scale)
-        verts_world = utils3d.np.transform_points(verts, pose)
+        verts, edges = camera_frustum_mesh(intr, frustum_scale)
+        verts_world = apply_transform(verts, pose)
         
         # Project to Screen
         vertices_homogeneous = np.concatenate([verts_world, np.ones((verts_world.shape[0], 1), dtype=np.float32)], axis=1)
@@ -511,7 +616,10 @@ def render_sequence(scene: SceneReconstructor,
                    fps: int = 24, 
                    accumulate_interval: int = 0,
                    rescale: bool = False,
-                   target_scale: float = 1.0):
+                   target_scale: float = 1.0,
+                   camera_distance: float = 1.35,
+                   camera_height: float = 0.15,
+                   render_point_size: int = 1):
     
     print("Rendering Video...")
     num_frames = len(scene.images)
@@ -521,10 +629,11 @@ def render_sequence(scene: SceneReconstructor,
     # Important: We perform rescaling on copies or modifying lists carefully
     # For brevity, let's assume we modify scene.points_world and scene.poses in place if rescale=True
     bbox_size = 1.0
-    if rescale and len(scene.points_world) > 0:
+    if len(scene.points_world) > 0:
         all_p = np.concatenate([p[m] for p, m in zip(scene.points_world, scene.masks)])
-        center = all_p.mean(axis=0)
         bbox_size = np.linalg.norm(all_p.max(axis=0) - all_p.min(axis=0))
+    if rescale and len(scene.points_world) > 0:
+        center = all_p.mean(axis=0)
         scale_factor = target_scale / (bbox_size + 1e-6)
         
         print(f"Rescaling scene by factor {scale_factor:.4f}...")
@@ -536,22 +645,34 @@ def render_sequence(scene: SceneReconstructor,
             
     # 2. Compute Trajectory
     get_eye, get_look = compute_smooth_trajectory(
-        scene.poses, scene.points_world, scene.masks, accumulate_interval
+        scene.poses,
+        scene.points_world,
+        scene.masks,
+        accumulate_interval,
+        camera_distance,
+        camera_height * bbox_size,
     )
     
     # 3. Setup Projection
     up_vec = np.array([0, -1, 0], dtype=np.float32) # Standard screen space up
-    proj = utils3d.np.perspective_from_fov(fov_y=np.deg2rad(60), near=0.01, far=1000, aspect_ratio=render_w / render_h)
+    proj = utils3d.numpy.perspective_from_fov(
+        fov=np.deg2rad(60),
+        width=render_w,
+        height=render_h,
+        near=0.01,
+        far=1000,
+    )
     
     rendered_frames = []
     
     for i in trange(num_frames, desc='Rendering'):
         # Determine camera for this frame
-        view = utils3d.np.view_look_at(get_eye(i), get_look(i), up_vec).astype(np.float32)
+        view = utils3d.numpy.view_look_at(get_eye(i), get_look(i), up_vec).astype(np.float32)
         
         # Gather points to render (current + accumulated history)
-        indices = [i]
-        if accumulate_interval > 0:
+        if accumulate_interval <= 0:
+            indices = list(range(i + 1))
+        else:
             indices = sorted(list(set([i] + list(range(0, i + 1, accumulate_interval)))))
             
         render_pts = []
@@ -565,11 +686,11 @@ def render_sequence(scene: SceneReconstructor,
         cols_combined = np.concatenate(render_cols).astype(np.float32)
         
         # Rasterize Points
-        out = utils3d.np.rasterize_point_cloud(
-            (render_h, render_w), points=pts_combined, 
-            attributes=cols_combined, point_sizes=3.0, 
-            point_shape='circle', view=view, 
-            projection=proj, return_depth=True
+        out = rasterize_point_cloud_simple(
+            (render_h, render_w), points=pts_combined,
+            attributes=cols_combined, point_size=render_point_size,
+            view=view,
+            projection=proj,
         )
         
         # Convert to Image
@@ -580,17 +701,7 @@ def render_sequence(scene: SceneReconstructor,
         frustum_size = max(bbox_size * 0.02, 0.05) if rescale else 0.1
         img_final = draw_frustums(img_render, i, scene.poses, scene.intrinsics, view, proj, frustum_size)
         
-        # Create Side-by-Side (Input | Render)
-        input_resized = cv2.resize(scene.images[i], (render_w, int(render_w * scene.images[i].shape[0] / scene.images[i].shape[1])))
-        # Pad input to match render height if needed, or just stack vertically/horizontally
-        # Here we just stack output_image = concat
-        # Note: simplistic resizing for demo
-        combo = np.vstack([
-            cv2.resize(input_resized, (render_w, 360)),
-            cv2.resize(img_final, (render_w, 360))
-        ])
-        
-        rendered_frames.append(combo.astype(np.uint8))
+        rendered_frames.append(img_final.astype(np.uint8))
         
     # Write Final Video
     vid_path = scene.output_dir / 'video'
@@ -613,9 +724,13 @@ def render_sequence(scene: SceneReconstructor,
 @click.option('--skip', type=int, default=1, help='Skip frames.')
 @click.option('--fps', type=int, default=24, help='Output video FPS.')
 @click.option('--voxel-size', type=float, default=0.002, help='Voxel size for global point cloud (0 to disable).')
-@click.option('--accumulate', 'accumulate_interval', type=int, default=0, help='Accumulate points every k frames for rendering.')
-@click.option('--rescale', is_flag=True, help='Rescale point cloud to unit size.')
-def main(video_path, output_path, pretrained, fov_x, input_size, start, end, skip, fps, voxel_size, accumulate_interval, rescale):
+@click.option('--accumulate', 'accumulate_interval', type=int, default=0, help='Accumulate points every k frames for rendering. 0 keeps all previous frame point clouds.')
+@click.option('--camera-distance', type=float, default=1.35, help='Multiplier that moves the render camera farther from the look-at point.')
+@click.option('--camera-height', type=float, default=0.15, help='Camera height offset as a fraction of the scene bounding-box diagonal.')
+@click.option('--render-point-size', type=int, default=1, help='Rendered point splat size in pixels. Use 1 for the finest point cloud.')
+@click.option('--use-cache/--no-use-cache', default=None, help='Use existing cached reconstruction results without prompting.')
+@click.option('--rescale', is_flag=True, help='Normalize point cloud scale for visualization. Leave unset to render reconstructed scale.')
+def main(video_path, output_path, pretrained, fov_x, input_size, start, end, skip, fps, voxel_size, accumulate_interval, camera_distance, camera_height, render_point_size, use_cache, rescale):
     
     # 1. Setup
     video_path = Path(video_path)
@@ -631,11 +746,14 @@ def main(video_path, output_path, pretrained, fov_x, input_size, start, end, ski
     write_video(scene.output_dir / 'video' / 'input.mp4', frames, fps=fps)
     
     # 3. Check for Cache & Decide Logic
-    use_cache = False
     if scene.has_cached_results():
-        # Ask user if they want to use existing results
-        if click.confirm(f"Found existing results in {scene.result_dir}. Do you want to use them?"):
-            use_cache = True
+        if use_cache is None:
+            # Ask user if they want to use existing results
+            use_cache = click.confirm(f"Found existing results in {scene.result_dir}. Do you want to use them?")
+    elif use_cache:
+        raise FileNotFoundError(f"No cached reconstruction results found in {scene.result_dir}")
+    else:
+        use_cache = False
             
     if use_cache:
         # PATH A: Use Cache (Fast, No Model Load)
@@ -650,7 +768,15 @@ def main(video_path, output_path, pretrained, fov_x, input_size, start, end, ski
     
     # 5. Render Visualization
     # Ensure helper functions like render_sequence are defined in the file
-    render_sequence(scene, fps=fps, accumulate_interval=accumulate_interval, rescale=rescale)
+    render_sequence(
+        scene,
+        fps=fps,
+        accumulate_interval=accumulate_interval,
+        rescale=rescale,
+        camera_distance=camera_distance,
+        camera_height=camera_height,
+        render_point_size=render_point_size,
+    )
     
     print(f"Processing complete. Results saved to {scene.output_dir}")
 
