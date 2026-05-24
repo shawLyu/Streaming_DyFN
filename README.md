@@ -57,6 +57,8 @@ Our pretrained models are organized as follows:
 
 ## 📊 Evaluation
 
+Detailed evaluation instructions are available in [docs/eval.md](docs/eval.md).
+
 Run baseline video evaluation with:
 
 ```bash
@@ -97,11 +99,11 @@ python moge/scripts/eval_video_baseline.py --video_dir_path ~/data_disk/dataset/
 
 ## 🏋️ Training
 
-Training instructions will be added here.
+Training and finetuning instructions are available in [docs/train.md](docs/train.md).
 
-## 🗂️ Data
+## 🗂️ Data Processing
 
-Dataset preparation details will be added here.
+Detailed data preparation and processing instructions are available in [docs/train.md](docs/train.md#data-preparation).
 
 ## 🤝 Acknowledgement
 
