@@ -15,8 +15,10 @@ import warnings
 import utils3d
 
 from moge.model.v1 import MoGeModel
-from moge.video_benchmark.eval.metric import *
-import moge.video_benchmark.eval.metric as metric
+try:
+    import moge.video_benchmark.eval.metric as metric
+except ModuleNotFoundError:
+    metric = None
 
 eval_metrics = [
     "abs_relative_difference",
@@ -346,6 +348,10 @@ def main(scene_dir, output, depth_scale, depth_min, depth_max, voxel_size, frame
     Reconstruct a ScanNet scene by combining point clouds from color, depth, intrinsic, and pose data.
     Always generates GT reconstruction. If --use_model_depth is set, also generates per_frame_align and sequential_align reconstructions.
     """
+    if enable_eval and metric is None:
+        print("Error: --enable_eval requires moge.video_benchmark.eval.metric, which is not available.")
+        return
+
     scene_dir = Path(scene_dir)
     
     # Check subdirectories exist
