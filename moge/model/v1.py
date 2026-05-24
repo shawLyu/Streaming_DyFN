@@ -303,7 +303,7 @@ class MoGeModel(nn.Module):
             cached_checkpoint_path = hf_hub_download(
                 repo_id=pretrained_model_name_or_path,
                 repo_type="model",
-                filename="model.pt",
+                filename="DyFN.pt",
                 **hf_kwargs
             )
             checkpoint = torch.load(cached_checkpoint_path, map_location='cpu', weights_only=True)

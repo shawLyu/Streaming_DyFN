@@ -138,7 +138,7 @@ benchmark/datasets/
 You can either evaluate from the DepthCrafter output path directly or copy/symlink it into your local data directory:
 
 ```bash
-python moge/scripts/eval_video_baseline.py --video_dir_path /path/to/DepthCrafter/benchmark/datasets --pretrained ./pretrained/model.pt
+python moge/scripts/eval_video_baseline.py --video_dir_path /path/to/DepthCrafter/benchmark/datasets --pretrained shawlyu/DyFN
 ```
 
 ### Run Evaluation
@@ -146,7 +146,7 @@ python moge/scripts/eval_video_baseline.py --video_dir_path /path/to/DepthCrafte
 Use the pretrained checkpoint with `--pretrained` and the video benchmark root with `--video_dir_path`:
 
 ```bash
-python moge/scripts/eval_video_baseline.py --video_dir_path ~/data_disk/dataset/local/depthcrafter/datasets/ --pretrained ./pretrained/model.pt
+python moge/scripts/eval_video_baseline.py --video_dir_path ~/data_disk/dataset/local/depthcrafter/datasets/ --pretrained shawlyu/DyFN
 ```
 
 By default, results are saved to `outputs_video/`:
@@ -180,7 +180,7 @@ outputs_video/
 To save visualization videos as well as metrics:
 
 ```bash
-python moge/scripts/eval_video_baseline.py --video_dir_path ~/data_disk/dataset/local/depthcrafter/datasets/ --pretrained ./pretrained/model.pt --save_video
+python moge/scripts/eval_video_baseline.py --video_dir_path ~/data_disk/dataset/local/depthcrafter/datasets/ --pretrained shawlyu/DyFN --save_video
 ```
 
 ## Image Geometry Estimation

@@ -50,7 +50,7 @@ Our pretrained models are organized as follows:
 
 | Version | Checkpoint | Base Model | Video Stability | #Params |
 | :--- | :--- | :---: | :---: | :---: |
-| DyFN | `./pretrained/model.pt` | MoGE-based | ✅ | 320M |
+| DyFN | [`shawlyu/DyFN`](https://huggingface.co/shawlyu/DyFN) / `./pretrained/DyFN.pt` | MoGE-based | ✅ | 320M |
 
 > NOTE: More checkpoint variants will be released soon.
 
@@ -61,7 +61,7 @@ Detailed evaluation instructions are available in [docs/eval.md](docs/eval.md).
 Run baseline video evaluation with:
 
 ```bash
-python moge/scripts/eval_video_baseline.py --video_dir_path ~/data_disk/dataset/local/depthcrafter/datasets/ --pretrained ./pretrained/model.pt
+python moge/scripts/eval_video_baseline.py --video_dir_path ~/data_disk/dataset/local/depthcrafter/datasets/ --pretrained shawlyu/DyFN
 ```
 
 ### Video Evaluation
