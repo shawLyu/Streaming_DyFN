@@ -4,7 +4,6 @@
 
 <a href=""><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
 <a href=''><img src='https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white' alt='Project Page'></a>
-<a href=''><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Live_Demo-blue'></a>
 
 </div>
 
@@ -19,14 +18,14 @@ DyFN improves temporal stability for streaming video geometry estimation while p
 ### Install via pip
   
 ```bash
-pip install git+https://github.com/shawLyu/DyFN.git
+pip install git+https://github.com/shawLyu/Streaming_DyFN.git
 ```
 
 ### Or clone this repository locally
 
 ```bash
-git clone https://github.com/shawLyu/DyFN.git
-cd DyFN
+git clone https://github.com/shawLyu/Streaming_DyFN.git
+cd Streaming_DyFN
 ```
 
 Then install dependencies:
@@ -51,9 +50,9 @@ Our pretrained models are organized as follows:
 
 | Version | Checkpoint | Base Model | Video Stability | #Params |
 | :--- | :--- | :---: | :---: | :---: |
-| DyFN | `./pretrained/model.pt` | MoGE-based | ✅ | TBA |
+| DyFN | `./pretrained/model.pt` | MoGE-based | ✅ | 320M |
 
-> NOTE: More variants and downloadable links (e.g., Hugging Face) will be released soon.
+> NOTE: More checkpoint variants will be released soon.
 
 ## 📊 Evaluation
 
