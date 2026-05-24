@@ -1,992 +1,513 @@
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import *
+
 if (_package_root := str(Path(__file__).absolute().parents[2])) not in sys.path:
     sys.path.insert(0, _package_root)
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'    # A workaround for potential compatibility issue with Windows
-import itertools
-import json
-import warnings
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-import numpy as np
-from tqdm import tqdm, trange
-import utils3d
-import click
-import torch
-import torch.nn.functional as F
 import cv2
-import matplotlib.pyplot as plt
-from scipy.interpolate import CubicSpline
-import open3d as o3d
-from omegaconf import DictConfig
+import click
+import numpy as np
+import torch
+import utils3d
+from tqdm import tqdm, trange
 
 from video_depth_anything.video_depth import VideoDepthAnything
 from third_party_models import pdcnet
 
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-def solve_pose_ransac(
-    p: np.ndarray,
-    q: np.ndarray,
-    w: np.ndarray = None,
-    max_iters: int = 20,
-    hypothetical_size: int = 10,
-    inlier_thresh: float = 0.02
-) -> np.ndarray:
-    n = p.shape[0]
-    if w is None:
-        w = np.ones(p.shape[0])
-    
-    best_score, best_inlines = 0., np.zeros(n, dtype=bool)
-    best_solution = np.eye(4, dtype=np.float32)
-
-    for _ in range(max_iters):
-        maybe_inliers = np.random.choice(n, size=hypothetical_size, replace=False)
-        try:
-            pose = utils3d.np.solve_pose(p[maybe_inliers], q[maybe_inliers], w[maybe_inliers], mode='rigid')
-        except np.linalg.LinAlgError:
-            continue
-        transformed_p = utils3d.np.transform_points(p, pose)
-        errors = w * np.linalg.norm(transformed_p - q, axis=1)
-        inliers = errors < inlier_thresh
-        
-        score = inlier_thresh * n - np.clip(errors, None, inlier_thresh).sum()
-        if score > best_score:
-            best_score, best_inlines = score, inliers
-            best_solution = utils3d.np.solve_pose(p[inliers], q[inliers], w[inliers], mode='rigid')
-    
-    return best_solution, best_inlines
+# Reuse the current MoGe reconstruction renderer/IO behavior so the VDA demo
+# produces the same output layout and accepts the same camera controls.
+from video_reconstruction import (  # noqa: E402
+    apply_transform,
+    get_correspondence_pdcnet,
+    read_frames,
+    render_sequence,
+    solve_pose_ransac,
+    write_ply,
+    write_video,
+)
 
 
-def extract_corresponding_pixels(flow, mask_shape):
-    h, w = mask_shape[:2]
-    grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
-    corresponding_x = (grid_x + flow[..., 0]).astype(int)
-    corresponding_y = (grid_y + flow[..., 1]).astype(int)
-
-    valid_mask = (corresponding_x >= 0) & (corresponding_x < w) & (corresponding_y >= 0) & (corresponding_y < h)
-    return valid_mask, corresponding_x, corresponding_y
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def read_frames_from_video(video_path, start: int = None, end: int = None, skip: int = None,target_size: Union[int, Tuple[int, int]] = None):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-
-    if isinstance(target_size, int):
-        original_width, original_height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        longer_size = max(original_width, original_height)
-        target_width, target_height = int(original_width * target_size / longer_size), int(original_height * target_size / longer_size)
-    else:
-        target_width, target_height = target_size
-
-    if start is None:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if end is not None and cap.get(cv2.CAP_PROP_POS_FRAMES) >= end:
-            break
-        if skip is not None and (cap.get(cv2.CAP_PROP_POS_FRAMES) - (start or 0)) % skip != 0:
-            continue
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  
-        frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
-        frames.append(frame)
-    cap.release()
-    return frames
+MODEL_CONFIGS = {
+    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+}
 
 
-def read_frames_from_folder(path: Union[str, os.PathLike], start: int = None, end: int = None, skip: int = None, target_size: Union[int, Tuple[int, int]] = None) -> Iterable[np.ndarray]:
-    frame_paths = sorted(Path(path).glob('*.jpg'))
-    frames = []
-    for p in tqdm(frame_paths[start:end:skip], desc='Reading frames'):
-        image = cv2.cvtColor(cv2.imread(p, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-        if isinstance(target_size, int):
-            longer_side = max(image.shape[:2])
-            image = cv2.resize(image, (int(image.shape[1] * target_size / longer_side), int(image.shape[0] * target_size / longer_side)), cv2.INTER_AREA)
-        elif isinstance(target_size, tuple):
-            image = cv2.resize(image, target_size, cv2.INTER_AREA)
-        frames.append(image)
-    return frames
-
-
-def write_video(path: Union[str, os.PathLike], frames: List[np.ndarray], fps: int = 20):
-    height, width, layers = frames[0].shape
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  
-    video = cv2.VideoWriter(str(path), fourcc, fps, (width, height))
-    for frame in frames:
-        video.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-    video.release()
-
-
-def write_ply(path: Union[str, os.PathLike], points: np.ndarray, colors: np.ndarray = None):
-    """
-    Write point cloud to PLY file format using open3d.
-    
-    Args:
-        path: Output PLY file path
-        points: Nx3 array of 3D points
-        colors: Optional Nx3 array of RGB colors (0-255)
-    """
-    # Create open3d point cloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-    
-    if colors is not None:
-        # Ensure colors are in 0-1 range for open3d
-        if colors.max() > 1.0:
-            colors_normalized = colors.astype(np.float64) / 255.0
-        else:
-            colors_normalized = colors.astype(np.float64)
-        pcd.colors = o3d.utility.Vector3dVector(colors_normalized)
-    
-    # Write PLY file
-    o3d.io.write_point_cloud(str(path), pcd)
-
-
-def downsample_pointcloud_voxel(points: np.ndarray, colors: np.ndarray = None, voxel_size: float = 0.01):
-    """
-    Downsample point cloud using voxel grid filtering with open3d.
-    
-    Args:
-        points: Nx3 array of 3D points
-        colors: Optional Nx3 array of RGB colors (0-255)
-        voxel_size: Size of each voxel for downsampling
-    
-    Returns:
-        Downsampled points and colors (if provided)
-    """
-    if len(points) == 0:
-        return points, colors
-    
-    # Create open3d point cloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-    
-    if colors is not None:
-        # Ensure colors are in 0-1 range for open3d
-        if colors.max() > 1.0:
-            colors_normalized = colors.astype(np.float64) / 255.0
-        else:
-            colors_normalized = colors.astype(np.float64)
-        pcd.colors = o3d.utility.Vector3dVector(colors_normalized)
-    
-    # Downsample using open3d
-    downsampled_pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
-    
-    # Convert back to numpy arrays
-    downsampled_points = np.asarray(downsampled_pcd.points).astype(np.float32)
-    
-    if colors is not None:
-        downsampled_colors = np.asarray(downsampled_pcd.colors)
-        # Convert colors back to 0-255 range if original was in that range
-        if colors.max() > 1.0:
-            downsampled_colors = (downsampled_colors * 255).astype(np.uint8)
-        else:
-            downsampled_colors = downsampled_colors.astype(np.float32)
-    else:
-        downsampled_colors = None
-    
-    return downsampled_points, downsampled_colors
-
-
-
-def find_correspondence_by_pdcnet(pdcnet_model, image_ref: np.ndarray, mask_ref: np.ndarray, image_query: np.ndarray, mask_query: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    height, width = image_query.shape[:2]
-    
-    image_ref = torch.tensor(image_ref, dtype=torch.uint8, device=device).permute(2, 0, 1)
-    image_query = torch.tensor(image_query, dtype=torch.uint8, device=device).permute(2, 0, 1)
-    flow, confidence = pdcnet.predict_flow(pdcnet_model, image_query, image_ref)
-    flow, confidence = flow.cpu().numpy(), confidence.cpu().numpy()
-    
-    uv_ref = utils3d.np.uv_map(height, width)
-    uv_tgt = uv_ref + flow
-    pixel_ref, pixel_tgt = utils3d.np.uv_to_pixel(uv_ref, (height, width)), utils3d.np.uv_to_pixel(uv_tgt, (height, width))
-    pixel_ref, pixel_tgt = pixel_ref.round().astype(int), pixel_tgt.round().astype(int)
-    valid = np.where(
-        (confidence > 0.5) 
-        & (pixel_tgt >= 0).all(axis=-1) 
-        & (pixel_tgt <= [width - 1, height - 1]).all(axis=-1) 
-        & mask_ref 
-        & mask_query[pixel_tgt.clip(0, [width - 1, height - 1])[:, :, 1], pixel_tgt.clip(0, [width - 1, height - 1])[:, :, 0]]
+def normalized_intrinsics_from_fov(fov_x: float, height: int, width: int) -> np.ndarray:
+    """Return intrinsics in normalized image coordinates, matching MoGe outputs."""
+    aspect = width / height
+    fx = 1.0 / (2.0 * np.tan(np.deg2rad(fov_x) / 2.0))
+    fy = fx * aspect
+    return np.array(
+        [
+            [fx, 0.0, 0.5],
+            [0.0, fy, 0.5],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
     )
-    pixel_ref, pixel_tgt = pixel_ref[valid], pixel_tgt[valid]
-    
-    return pixel_ref, pixel_tgt
 
 
 def depth_to_points(depth: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
-    """
-    Back-project depth image to 3D points in camera space.
-    
-    Args:
-        depth: Depth image (H, W) in meters
-        intrinsics: 3x3 or 4x4 intrinsic matrix
-    
-    Returns:
-        points: (H, W, 3) array of 3D points in camera space
-    """
+    """Back-project a depth map using normalized image-coordinate intrinsics."""
     h, w = depth.shape
-    
-    # Extract intrinsic parameters
-    if intrinsics.shape == (4, 4):
-        fx = intrinsics[0, 0]
-        fy = intrinsics[1, 1]
-        cx = intrinsics[0, 2]
-        cy = intrinsics[1, 2]
-    else:
-        fx = intrinsics[0, 0]
-        fy = intrinsics[1, 1]
-        cx = intrinsics[0, 2]
-        cy = intrinsics[1, 2]
-    
-    # Create pixel coordinates
-    u, v = np.meshgrid(np.arange(w), np.arange(h))
-    
-    # Convert to normalized coordinates
-    x_norm = (u - cx) / fx
-    y_norm = (v - cy) / fy
-    
-    # Back-project to 3D
-    x = x_norm * depth
-    y = y_norm * depth
-    z = depth
-    
-    points = np.stack([x, y, z], axis=-1)
-    return points
+    u, v = np.meshgrid(
+        (np.arange(w, dtype=np.float32) + 0.5) / w,
+        (np.arange(h, dtype=np.float32) + 0.5) / h,
+    )
+    fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
+    cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
+    points = np.stack([(u - cx) / fx * depth, (v - cy) / fy * depth, depth], axis=-1)
+    return points.astype(np.float32)
 
 
-def intrinsics_from_fov(fov_x: float, height: int, width: int) -> np.ndarray:
-    """
-    Compute intrinsic matrix from horizontal FOV.
-    
-    Args:
-        fov_x: Horizontal field of view in degrees
-        height: Image height
-        width: Image width
-    
-    Returns:
-        intrinsics: 3x3 intrinsic matrix
-    """
-    fov_x_rad = np.deg2rad(fov_x)
-    fx = width / (2 * np.tan(fov_x_rad / 2))
-    fy = fx  # Assume square pixels
-    cx = width / 2
-    cy = height / 2
-    
-    intrinsics = np.array([
-        [fx, 0, cx],
-        [0, fy, cy],
-        [0, 0, 1]
-    ], dtype=np.float32)
-    return intrinsics
+def depth_edge(depth: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    edge_fn = getattr(utils3d.numpy, 'depth_edge', None)
+    if edge_fn is not None:
+        return edge_fn(depth, rtol=0.05, mask=mask)
+    return utils3d.numpy.depth_map_edge(depth, rtol=0.05, mask=mask)
 
 
-def ensure_even(value: int) -> int:
-    """Ensure value is even."""
-    return value if value % 2 == 0 else value - 1
+def finite_depth_mask(depth: np.ndarray) -> np.ndarray:
+    return np.isfinite(depth) & (depth > 1e-6)
 
 
-@click.command()
-@click.option('--video', 'video_path', type=str, help='Input video path')
-@click.option('--fov_x', type=float, default=None, help='Horizontal field of view in degrees')
-@click.option('--start', type=int, default=None, help='Start frame index')
-@click.option('--end', type=int, default=None, help='End frame index')
-@click.option('--skip', type=int, default=1, help='Frame skip rate')
-@click.option('--input_size', type=int, default=640, help='Resize the input video to a specific size (longer side)')
-@click.option('--ref-offset', 'ref_offset', type=click.Tuple([int, int, int]), default=[1, 5, 21], help='Reference frame offset')
-@click.option('--camera', 'camera_path', type=str, default=None, help='Trajectory file path')
-@click.option('--pretrained', 'pretrained_model_name_or_path', type=str, required=True, help='Path to VideoDepthAnything pretrained model checkpoint')
-@click.option('--output', 'output_path', type=str, default='video_output', help='Output directory')
-@click.option('--fps', type=int, default=24, help='Output video FPS')
-@click.option('--voxel-size', 'voxel_size', type=float, default=0.00001, help='Voxel size for point cloud downsampling (0 to disable)')
-@click.option('--max_res', type=int, default=1280, help='Maximum resolution dimension for model inference')
-@click.option('--input_size_model', type=int, default=518, help='Input size for VideoDepthAnything model inference')
-@click.option('--target_fps', type=int, default=-1, help='Target FPS for VideoDepthAnything inference (-1 to use original FPS)')
-@click.option('--accumulate-pointcloud-interval', 'accumulate_pc_interval', type=int, default=0, help='Accumulate point clouds from previous frames every k frames (0 to disable, only render current frame)')
-@click.option('--fixed-view', 'use_fixed_view', is_flag=True, help='Use fixed camera view instead of trajectory')
-@click.option('--fixed-eye', type=click.Tuple([float, float, float]), default=None, help='Fixed camera eye position (x, y, z). If not provided, will use a default position based on point cloud')
-@click.option('--fixed-look-at', type=click.Tuple([float, float, float]), default=None, help='Fixed camera look_at position (x, y, z). If not provided, will use point cloud center')
-@click.option('--fixed-fov', type=float, default=60.0, help='Field of view in degrees for fixed view (default: 60.0)')
-@click.option('--fixed-up', type=click.Tuple([float, float, float]), default=(0.0, -1, 0.0), help='Up vector for fixed view (default: (0, 1, 0))')
-@click.option('--rescale-pointcloud', 'rescale_pointcloud', is_flag=True, help='Rescale point cloud to a target size for consistent rendering')
-@click.option('--target-scale', type=float, default=1.0, help='Target scale for point cloud rescaling (default: 1.0, meaning normalize to unit size)')
-def main(video_path: str, fov_x: float, start: int, end: int, skip: int, input_size: int, ref_offset: List[int], camera_path: str, pretrained_model_name_or_path: str, output_path: str, fps: int, voxel_size: float, max_res: int, input_size_model: int, target_fps: int, accumulate_pc_interval: int, use_fixed_view: bool, fixed_eye: Tuple[float, float, float], fixed_look_at: Tuple[float, float, float], fixed_fov: float, fixed_up: Tuple[float, float, float], rescale_pointcloud: bool, target_scale: float):
-    if Path(video_path).is_file():
-        image_frames = read_frames_from_video(video_path, start, end, skip, target_size=input_size)
-    elif Path(video_path).is_dir():
-        image_frames = read_frames_from_folder(video_path, start, end, skip, target_size=input_size)
-    else:
-        raise ValueError(f"Invalid video path: {video_path}")
-    video_name = Path(video_path).stem
+def estimate_depth_affine_from_reference(
+    depths: np.ndarray,
+    reference_result_dir: Path,
+    target_shape: Tuple[int, int],
+) -> Tuple[float, float]:
+    """Estimate global VDA depth scale/shift from a reference reconstruction cache."""
+    if not reference_result_dir.exists():
+        raise FileNotFoundError(f"Reference result directory not found: {reference_result_dir}")
 
-    input_height, input_width = image_frames[0].shape[:2]
-    num_frames = len(image_frames)
+    src_values, ref_values = [], []
+    for i in range(depths.shape[0]):
+        prefix = f'{i:05d}'
+        ref_depth_path = reference_result_dir / f'{prefix}_depth_registered.exr'
+        ref_mask_path = reference_result_dir / f'{prefix}_mask.png'
+        if not ref_depth_path.exists() or not ref_mask_path.exists():
+            continue
 
-    prediction_frames, pose_frames, canonical_points_frames, inlier_mask_frames = [], [], [], []
+        src_depth = depths[i].astype(np.float32)
+        ref_depth = cv2.imread(str(ref_depth_path), cv2.IMREAD_UNCHANGED)
+        ref_mask = cv2.imread(str(ref_mask_path), cv2.IMREAD_GRAYSCALE)
+        if ref_depth is None or ref_mask is None:
+            continue
 
-    # Check if there are existing results
-    if Path(output_path, video_name, 'result').exists():
-        use_existing_results = click.confirm(f"Found existing results in {output_path}/{video_name}/result. Do you want to use them?")
-    else:
-        use_existing_results = False
+        height, width = target_shape
+        if ref_depth.shape != (height, width):
+            ref_depth = cv2.resize(ref_depth.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+            ref_mask = cv2.resize(ref_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
 
-    if use_existing_results:
-        # Load existing results
-        points_paths = sorted(Path(output_path, video_name, 'result').glob('*_points.exr'))
-        for p in tqdm(points_paths, desc='Loading existing results'):
-            points = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
-            mask = cv2.imread(str(p.as_posix().replace('_points.exr', '_mask.png')), cv2.IMREAD_GRAYSCALE) > 0
-            cam = np.load(str(p.as_posix().replace('_points.exr', '_cam.npz')))
-            pose, intrinsics = cam['pose'], cam['intrinsics']
-            inlier_mask = cv2.imread(str(p.as_posix().replace('_points.exr', '_inlier_mask.png')), cv2.IMREAD_GRAYSCALE) > 0
-            canonical_points = utils3d.np.transform_points(points, pose)
-            prediction_frames.append((points, mask))
-            canonical_points_frames.append(canonical_points)
-            pose_frames.append((pose, intrinsics))
-            inlier_mask_frames.append(inlier_mask)
-    else:
-        # Load VideoDepthAnything model
-        print(f"==> Loading VideoDepthAnything model: {pretrained_model_name_or_path}")
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
-        
-        # Model configs for VideoDepthAnything (following eval_video_long_vda.py)
-        model_configs = {
-            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-        }
-        
-        # Initialize VideoDepthAnything model with vitl config
-        vda_model = VideoDepthAnything(**model_configs['vitl'], metric="video_depth_anything")
-        vda_model.load_state_dict(torch.load(pretrained_model_name_or_path, map_location='cpu'), strict=True)
-        vda_model = vda_model.to(device).eval()
-        print(f"==> Model loaded on {device}")
-        
-        # Prepare frames for VideoDepthAnything inference
-        # VideoDepthAnything expects frames as numpy array in RGB format
-        print("==> Preparing frames for VideoDepthAnything inference...")
-        frames_array = []
-        original_sizes = []
-        for curr_image in image_frames:
-            h, w = curr_image.shape[:2]
-            original_sizes.append((h, w))
-            
-            # Resize if needed to fit within max_res
-            if max_res > 0 and max(h, w) > max_res:
-                scale = max_res / max(h, w)
-                new_h = ensure_even(round(h * scale))
-                new_w = ensure_even(round(w * scale))
-                curr_image_resized = cv2.resize(curr_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            else:
-                curr_image_resized = curr_image
-            
-            # Ensure image is in uint8 format (0-255)
-            if curr_image_resized.dtype != np.uint8:
-                if curr_image_resized.max() <= 1.0:
-                    curr_image_resized = (curr_image_resized * 255).astype(np.uint8)
-                else:
-                    curr_image_resized = curr_image_resized.astype(np.uint8)
-            
-            frames_array.append(curr_image_resized)
-        
-        # Stack frames into numpy array: (N, H, W, 3)
-        frames_array = np.stack(frames_array, axis=0)
-        
-        # Run VideoDepthAnything inference on all frames
-        print(f"==> Running VideoDepthAnything inference on {num_frames} frames...")
-        with torch.no_grad():
-            # VideoDepthAnything.infer_video_depth expects frames as numpy array
-            # Returns depths as numpy array and fps
-            depths, inferred_fps = vda_model.infer_video_depth(
-                frames_array, 
-                target_fps, 
-                input_size=input_size_model, 
-                device=device.type, 
-                fp32=True
+        valid = (
+            (ref_mask > 0)
+            & np.isfinite(src_depth)
+            & np.isfinite(ref_depth)
+            & (src_depth > 1e-6)
+            & (ref_depth > 1e-6)
+        )
+        if valid.sum() > 1000:
+            src_values.append(src_depth[valid].reshape(-1, 1))
+            ref_values.append(ref_depth[valid].reshape(-1, 1))
+
+    if not src_values:
+        raise RuntimeError(f"No overlapping valid depths found in {reference_result_dir}")
+
+    src = np.concatenate(src_values, axis=0)
+    ref = np.concatenate(ref_values, axis=0)
+    design = np.concatenate([src, np.ones_like(src)], axis=1)
+    scale, shift = np.linalg.lstsq(design, ref, rcond=None)[0].ravel()
+    return float(scale), float(shift)
+
+
+class VdaSceneReconstructor:
+    def __init__(self, video_path: Path, output_dir: Path):
+        self.video_name = video_path.stem
+        self.output_dir = output_dir / self.video_name
+        self.result_dir = self.output_dir / 'result'
+        self.result_dir.mkdir(parents=True, exist_ok=True)
+
+        self.images: List[np.ndarray] = []
+        self.masks: List[np.ndarray] = []
+        self.points_local: List[np.ndarray] = []
+        self.points_world: List[np.ndarray] = []
+        self.poses: List[np.ndarray] = []
+        self.intrinsics: List[np.ndarray] = []
+
+        self.vda_model = None
+        self.pdcnet_model = None
+
+    def has_cached_results(self) -> bool:
+        return len(list(self.result_dir.glob('*_cam.npz'))) > 0
+
+    def load_models(self, checkpoint_path: str, encoder: str, metric: bool):
+        checkpoint = Path(checkpoint_path)
+        if not checkpoint.exists():
+            raise FileNotFoundError(
+                f"Video Depth Anything checkpoint not found: {checkpoint}. "
+                "Download video_depth_anything_vitl.pth or pass --pretrained to the correct file."
             )
-            depths = 1 / depths
-        
-        # depths shape: (N, H, W) - numpy array
-        print(f"==> VideoDepthAnything inference complete. Depth shape: {depths.shape}, FPS: {inferred_fps}")
-        
-        # Compute intrinsics from fov_x if provided, otherwise estimate from image size
-        if fov_x is not None:
-            intrinsics_3x3 = intrinsics_from_fov(fov_x, input_height, input_width)
-        else:
-            # Default intrinsics (assume reasonable FOV)
-            intrinsics_3x3 = intrinsics_from_fov(60.0, input_height, input_width)
-        
-        # Convert to 4x4 for consistency
-        intrinsics = np.eye(4, dtype=np.float32)
-        intrinsics[:3, :3] = intrinsics_3x3
-        
-        # Load PDCNet for correspondence
-        pdcnet_model = pdcnet.load_model('pretrained/PDCNet_megadepth.pth.tar')
-        
-        Path(output_path, video_name, 'result').mkdir(parents=True, exist_ok=True)
-        
-        # Process each frame: convert depth to points and solve pose
-        for i_curr in trange(num_frames, desc='Processing frames'):
-            curr_image = image_frames[i_curr]
-            h_orig, w_orig = original_sizes[i_curr]
-            
-            # Get depth for current frame
-            if i_curr >= depths.shape[0]:
-                print(f"Warning: Frame {i_curr} exceeds depth array size {depths.shape[0]}. Skipping.")
+
+        print(f"Loading Video Depth Anything model from {checkpoint}...")
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        self.vda_model = VideoDepthAnything(**MODEL_CONFIGS[encoder], metric=metric)
+        self.vda_model.load_state_dict(torch.load(str(checkpoint), map_location='cpu'), strict=True)
+        self.vda_model = self.vda_model.to(DEVICE).eval()
+
+        print("Loading PDCNet model...")
+        self.pdcnet_model = pdcnet.load_model('pretrained/PDCNet_megadepth.pth.tar')
+
+    def load_cached_results(self, frames: List[np.ndarray]):
+        self.images = []
+        files = sorted(self.result_dir.glob('*_points.exr'))
+        if not files:
+            raise FileNotFoundError("No cached VDA reconstruction files found.")
+
+        print(f"Loading {len(files)} cached frames from {self.result_dir}...")
+        for p in tqdm(files, desc='Loading Cache'):
+            try:
+                idx = int(p.name.split('_')[0])
+            except ValueError:
                 continue
-            d_est = depths[i_curr].copy()  # Shape: [H, W]
-            
-            # Resize depth to original image size if needed
-            if d_est.shape != (h_orig, w_orig):
-                d_est = cv2.resize(d_est, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
-            
-            # Resize intrinsics if image was resized
-            if (h_orig, w_orig) != (input_height, input_width):
-                scale_h = h_orig / input_height
-                scale_w = w_orig / input_width
-                intrinsics_scaled = intrinsics.copy()
-                intrinsics_scaled[0, 0] *= scale_w
-                intrinsics_scaled[1, 1] *= scale_h
-                intrinsics_scaled[0, 2] *= scale_w
-                intrinsics_scaled[1, 2] *= scale_h
-            else:
-                intrinsics_scaled = intrinsics
-            
-            # Back-project depth to 3D points
-            curr_points = depth_to_points(d_est, intrinsics_scaled)
-            
-            # Create mask (valid depth points)
-            curr_mask = ~utils3d.np.depth_map_edge(d_est, rtol=0.05, mask=None)
-            
-            # Solve pose
+            if idx >= len(frames):
+                continue
+
+            prefix = f'{idx:05d}'
+            mask_path = self.result_dir / f'{prefix}_mask.png'
+            cam_path = self.result_dir / f'{prefix}_cam.npz'
+            if not mask_path.exists() or not cam_path.exists():
+                continue
+
+            points = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE) > 0
+            cam = np.load(str(cam_path))
+            pose, intrinsics = cam['pose'], cam['intrinsics']
+
+            self.images.append(frames[idx])
+            self.points_local.append(points)
+            self.masks.append(mask)
+            self.points_world.append(apply_transform(points, pose).astype(np.float32))
+            self.poses.append(pose)
+            self.intrinsics.append(intrinsics)
+        print("Cache load complete.")
+
+    def run_inference(
+        self,
+        images: List[np.ndarray],
+        fov_x: float = None,
+        ref_offsets: List[int] = (1, 5, 21),
+        input_size_model: int = 518,
+        target_fps: int = -1,
+        invert_depth: bool = True,
+        depth_scale: float = 1.0,
+        depth_shift: float = 0.0,
+        align_depth_reference: Optional[Path] = None,
+    ):
+        if self.vda_model is None or self.pdcnet_model is None:
+            raise RuntimeError("Models not loaded. Call load_models() first.")
+
+        self.images = images
+        num_frames = len(images)
+        if num_frames == 0:
+            raise ValueError("No frames were loaded from the input video.")
+
+        frames = np.stack([img.astype(np.uint8) for img in images], axis=0)
+        print(f"Running Video Depth Anything on {num_frames} frames...")
+        with torch.no_grad():
+            depths, inferred_fps = self.vda_model.infer_video_depth(
+                frames,
+                target_fps,
+                input_size=input_size_model,
+                device=DEVICE.type,
+                fp32=True,
+            )
+        depths = np.asarray(depths, dtype=np.float32)
+        if invert_depth:
+            depths = 1.0 / np.maximum(depths, 1e-6)
+        if align_depth_reference is not None:
+            depth_scale, depth_shift = estimate_depth_affine_from_reference(
+                depths,
+                align_depth_reference,
+                target_shape=images[0].shape[:2],
+            )
+            print(
+                f"Aligning VDA depths to {align_depth_reference}: "
+                f"scale={depth_scale:.6f}, shift={depth_shift:.6f}"
+            )
+        if depth_scale != 1.0 or depth_shift != 0.0:
+            depths = depth_scale * depths + depth_shift
+            depths = np.maximum(depths, 1e-6)
+        print(f"VDA inference complete. Depth shape: {depths.shape}, FPS: {inferred_fps}")
+
+        print("Running Registration...")
+        for i_curr in trange(num_frames, desc='Processing Frames'):
+            img = images[i_curr]
+            h, width = img.shape[:2]
+            depth = depths[i_curr]
+            if depth.shape != (h, width):
+                depth = cv2.resize(depth, (width, h), interpolation=cv2.INTER_LINEAR)
+
+            intrinsics = normalized_intrinsics_from_fov(fov_x or 60.0, h, width)
+            curr_points = depth_to_points(depth, intrinsics)
+            curr_mask = finite_depth_mask(depth)
+            curr_mask &= ~depth_edge(depth, curr_mask)
+
             if i_curr == 0:
-                # For the first frame, just normalize the scale and set identity pose
                 pose = np.eye(4, dtype=np.float32)
                 inlier_mask = np.zeros_like(curr_mask, dtype=bool)
             else:
-                # Similar registration with previous reference frames
-                ref_indices = [i_curr - i for i in ref_offset if i_curr - i >= 0]
-                assert len(ref_indices) > 0
-                p, q, w, pixel_indices = [], [], [], []
+                ref_indices = [i_curr - k for k in ref_offsets if i_curr - k >= 0]
+                p_list, q_list, w_list, pixel_indices = [], [], [], []
+
                 for i_ref in ref_indices:
-                    ref_image, ref_points, ref_mask = image_frames[i_ref], canonical_points_frames[i_ref], prediction_frames[i_ref][1]
-                    corresp_pixel_ref, corresp_pixel_curr = find_correspondence_by_pdcnet(pdcnet_model, ref_image, ref_mask, curr_image, curr_mask)
-                    p.append(curr_points[corresp_pixel_curr[:, 1], corresp_pixel_curr[:, 0]])
-                    q.append(ref_points[corresp_pixel_ref[:, 1], corresp_pixel_ref[:, 0]])
-                    w.append(1 / curr_points[corresp_pixel_curr[:, 1], corresp_pixel_curr[:, 0], 2])
-                    pixel_indices.append(corresp_pixel_curr[:, 1] * input_width + corresp_pixel_curr[:, 0])
-                p, q, w, pixel_indices = np.concatenate(p), np.concatenate(q), np.concatenate(w), np.concatenate(pixel_indices)
-                pose, inlines = solve_pose_ransac(p, q, w)
-                inlier_pixel_indices, inlier_pixel_cnts = np.unique(pixel_indices[inlines], return_counts=True)
-                inlier_pixel_indices = inlier_pixel_indices[inlier_pixel_cnts == len(ref_indices)]
-                inlier_mask = np.zeros_like(curr_mask)
-                inlier_mask[inlier_pixel_indices // input_width, inlier_pixel_indices % input_width] = True
-            
-            s = np.linalg.det(pose[:3, :3])
+                    ref_img = self.images[i_ref]
+                    ref_pts_world = self.points_world[i_ref]
+                    ref_mask = self.masks[i_ref]
+                    pix_ref, pix_curr = get_correspondence_pdcnet(
+                        self.pdcnet_model,
+                        ref_img,
+                        ref_mask,
+                        img,
+                        curr_mask,
+                    )
+                    if len(pix_curr) == 0:
+                        continue
+                    curr_corr = curr_points[pix_curr[:, 1], pix_curr[:, 0]]
+                    ref_corr = ref_pts_world[pix_ref[:, 1], pix_ref[:, 0]]
+                    valid = np.isfinite(curr_corr).all(axis=1) & np.isfinite(ref_corr).all(axis=1)
+                    if not np.any(valid):
+                        continue
 
-            # Save intermediate results
-            cv2.imwrite(str(Path(output_path, video_name, 'result', f'{i_curr:05d}_points.exr')), curr_points.astype(np.float32))
-            cv2.imwrite(str(Path(output_path, video_name, 'result', f'{i_curr:05d}_depth_registered.exr')), s.astype(np.float32) * d_est.astype(np.float32))
-            cv2.imwrite(str(Path(output_path, video_name, 'result', f'{i_curr:05d}_mask.png')), (curr_mask * 255).astype(np.uint8))
-            np.savez(str(Path(output_path, video_name, 'result', f'{i_curr:05d}_cam.npz')), pose=pose, intrinsics=intrinsics_scaled[:3, :3])
-            cv2.imwrite(str(Path(output_path, video_name, 'result', f'{i_curr:05d}_inlier_mask.png')), (inlier_mask * 255).astype(np.uint8))
-            
-            curr_points_canonical = utils3d.np.transform_points(curr_points, pose)
-            prediction_frames.append((curr_points, curr_mask))
-            pose_frames.append((pose, intrinsics_scaled[:3, :3].astype(np.float32)))
-            canonical_points_frames.append(curr_points_canonical.astype(np.float32))
-            inlier_mask_frames.append(inlier_mask)
+                    curr_corr = curr_corr[valid]
+                    ref_corr = ref_corr[valid]
+                    pix_curr = pix_curr[valid]
+                    p_list.append(curr_corr)
+                    q_list.append(ref_corr)
+                    w_list.append(1.0 / np.maximum(curr_corr[:, 2], 1e-6))
+                    pixel_indices.append(pix_curr[:, 1] * width + pix_curr[:, 0])
 
-    # Combine all point clouds and save to PLY
-    print('Combining point clouds from all frames...')
-    combined_points = []
-    combined_colors = []
-    
-    # Create directory for separate point clouds
-    separate_pc_dir = Path(output_path, video_name, 'pointclouds')
-    separate_pc_dir.mkdir(parents=True, exist_ok=True)
-
-    for idx in tqdm(range(num_frames), desc='Processing point clouds'):
-        mask = prediction_frames[idx][1]
-        points = canonical_points_frames[idx][mask]
-        colors = image_frames[idx][mask]
-        # Ensure colors are in 0-255 uint8 format
-        if colors.dtype != np.uint8:
-            if colors.max() <= 1.0:
-                colors = (colors * 255).astype(np.uint8)
-            else:
-                colors = colors.astype(np.uint8)
-        
-        # Save individual point cloud
-        frame_ply_path = separate_pc_dir / f'frame_{idx:05d}.ply'
-        write_ply(frame_ply_path, points, colors)
-        
-        # Add to combined point cloud (every 15th frame)
-        if idx % 15 == 0:
-            combined_points.append(points)
-            combined_colors.append(colors)
-    
-    combined_points = np.concatenate(combined_points, axis=0)
-    combined_colors = np.concatenate(combined_colors, axis=0)
-    
-    # Downsample point cloud if voxel_size > 0
-    if voxel_size > 0:
-        print(f'Downsampling point cloud with voxel size {voxel_size}...')
-        original_count = combined_points.shape[0]
-        combined_points, combined_colors = downsample_pointcloud_voxel(combined_points, combined_colors, voxel_size=voxel_size)
-        print(f'Downsampled from {original_count} to {combined_points.shape[0]} points ({100 * combined_points.shape[0] / original_count:.1f}%)')
-    
-    # Save combined point cloud with camera frustums to PLY
-    ply_output_path = Path(output_path, video_name, 'combined_pointcloud.ply')
-    print(f'Saving combined point cloud to {ply_output_path}...')
-    write_ply(ply_output_path, combined_points, combined_colors)
-    
-    # Render
-    if camera_path is not None or use_fixed_view:
-        render_height, render_width = 768, 1024
-
-        # Compute average point cloud center for look_at reference
-        all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
-        point_cloud_center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
-        
-        # Rescale point cloud if requested
-        rescale_factor = 1.0
-        if rescale_pointcloud and len(all_points) > 0:
-            # Calculate bounding box
-            bbox_min = all_points.min(axis=0)
-            bbox_max = all_points.max(axis=0)
-            bbox_size = np.linalg.norm(bbox_max - bbox_min)
-            
-            if bbox_size > 1e-6:  # Avoid division by zero
-                # Calculate scale factor to normalize to target_scale
-                rescale_factor = target_scale / bbox_size
-                
-                print(f'Rescaling point cloud: bbox_size={bbox_size:.4f}, target_scale={target_scale:.4f}, scale_factor={rescale_factor:.4f}')
-                
-                # Rescale all point clouds and poses
-                for i in range(num_frames):
-                    mask = prediction_frames[i][1]
-                    # Rescale: (points - center) * scale + center
-                    canonical_points_frames[i][mask] = (canonical_points_frames[i][mask] - point_cloud_center) * rescale_factor + point_cloud_center
-                    
-                    # Rescale pose translation: (translation - center) * scale + center
-                    pose, intrinsics = pose_frames[i]
-                    pose_translation = pose[:3, 3]
-                    pose[:3, 3] = (pose_translation - point_cloud_center) * rescale_factor + point_cloud_center
-                    pose_frames[i] = (pose, intrinsics)
-                
-                # Update point cloud center (should remain the same after rescale)
-                # But recalculate to be safe
-                all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
-                point_cloud_center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
-        
-        # Handle fixed view mode
-        if use_fixed_view:
-            # Determine look_at position
-            if fixed_look_at is not None:
-                look_at_pos = np.array(fixed_look_at, dtype=np.float32)
-                # If rescaling, adjust look_at position relative to point cloud center
-                if rescale_pointcloud:
-                    # Rescale: (pos - center) * scale + center
-                    look_at_pos = (look_at_pos - point_cloud_center) * rescale_factor + point_cloud_center
-            else:
-                look_at_pos = point_cloud_center
-            
-            # Determine eye position
-            if fixed_eye is not None:
-                eye_pos = np.array(fixed_eye, dtype=np.float32)
-                # If rescaling, adjust eye position relative to point cloud center
-                if rescale_pointcloud:
-                    # Rescale: (pos - center) * scale + center
-                    eye_pos = (eye_pos - point_cloud_center) * rescale_factor + point_cloud_center
-            else:
-                # Compute default eye position: offset from point cloud center
-                # Calculate bounding box to determine a good viewing distance
-                if len(all_points) > 0:
-                    bbox_min = all_points.min(axis=0)
-                    bbox_max = all_points.max(axis=0)
-                    bbox_size = np.linalg.norm(bbox_max - bbox_min)
-                    # Place camera at a distance proportional to bbox size
-                    # After rescale, bbox_size should be approximately target_scale
-                    offset_distance = bbox_size * 0.5
-                    # Default view from negative Z direction (looking towards positive Z)
-                    # This matches the typical camera coordinate system where camera looks along -Z
-                    eye_pos = look_at_pos + np.array([-0.5, -0.5, -offset_distance], dtype=np.float32)
-                else:
-                    eye_pos = np.array([0, 0, -1], dtype=np.float32)
-            
-            up = np.array(fixed_up, dtype=np.float32)
-            render_projection = utils3d.np.perspective_from_fov(fov_y=np.deg2rad(fixed_fov), near=0.01, far=np.inf, aspect_ratio=render_width / render_height)
-            
-            # Create fixed view function
-            def fixed_eye_traj(frame_idx):
-                return eye_pos
-            
-            def fixed_look_at_traj(frame_idx):
-                return look_at_pos
-            
-            # Use fixed trajectory functions
-            blended_eye_traj = fixed_eye_traj
-            blended_look_at_traj = fixed_look_at_traj
-        
-        # Extract computed camera positions from poses (for trajectory mode)
-        if camera_path is not None and not use_fixed_view:
-            computed_eye_positions = []
-            computed_look_at_positions = []
-            
-            for idx in range(num_frames):
-                pose, intrinsics = pose_frames[idx]
-                # Extract camera position (translation part of pose)
-                eye_pos = pose[:3, 3]
-                computed_eye_positions.append(eye_pos)
-                
-                # Compute look_at position: use the center of visible points for this frame
-                # This ensures the camera looks at the scene it's observing
-                frame_points = canonical_points_frames[idx][prediction_frames[idx][1]]
-                if len(frame_points) > 0:
-                    # Use center of visible points in this frame
-                    frame_center = frame_points.mean(axis=0)
-                    look_at_pos = frame_center
-                else:
-                    # Fallback: use global point cloud center
-                    look_at_pos = point_cloud_center
-                
-                computed_look_at_positions.append(look_at_pos)
-            
-            computed_eye_positions = np.array(computed_eye_positions, dtype=np.float32)
-            computed_look_at_positions = np.array(computed_look_at_positions, dtype=np.float32)
-
-            # Smooth the computed camera trajectories to reduce jitter
-            def smooth_trajectory(positions, window_size=5):
-                """
-                Smooth trajectory using moving average with edge handling.
-                """
-                if len(positions) < 3:
-                    return positions
-                
-                smoothed = np.zeros_like(positions)
-                half_window = window_size // 2
-                
-                for i in range(len(positions)):
-                    # Determine window bounds
-                    start = max(0, i - half_window)
-                    end = min(len(positions), i + half_window + 1)
-                    
-                    # Use available points in window
-                    window = positions[start:end]
-                    smoothed[i] = window.mean(axis=0)
-                
-                return smoothed
-            
-            # Apply smoothing to camera positions and look_at positions
-            smoothed_eye_positions = smooth_trajectory(computed_eye_positions, window_size=5)
-            smoothed_look_at_positions = smooth_trajectory(computed_look_at_positions, window_size=5)
-            
-            # Create cubic spline interpolation for even smoother trajectories
-            if num_frames > 3:
-                frame_indices = np.arange(num_frames, dtype=np.float32)
-                eye_spline = CubicSpline(frame_indices, smoothed_eye_positions, bc_type='natural')
-                look_at_spline = CubicSpline(frame_indices, smoothed_look_at_positions, bc_type='natural')
-            else:
-                eye_spline = None
-                look_at_spline = None
-
-            # Create blended trajectory: start with computed trajectory, gradually transition to user trajectory
-            transition_frames = min(50, num_frames // 2)  # Transition over first 50 frames or 1/2 of video
-
-            # Load camera trajectory config first (for up vector, fov, and forward axis config)
-            with open(camera_path, 'r') as f:
-                camera_config = json.load(f)
-                camera_config['eye'][0] = computed_eye_positions[transition_frames].tolist()
-                camera_config['look_at'][0] = computed_look_at_positions[transition_frames].tolist()
-                user_eye_traj = CubicSpline(
-                    np.linspace(0, num_frames - 1, len(camera_config['eye'])), 
-                    np.array(camera_config['eye'], dtype=np.float32), 
-                    bc_type="periodic" if camera_config['eye'][0] == camera_config['eye'][-1] else "not-a-knot"
-                )
-                user_look_at_traj = CubicSpline(
-                    np.linspace(0, num_frames - 1, len(camera_config['look_at'])), 
-                    np.array(camera_config['look_at'], dtype=np.float32), 
-                    bc_type="periodic" if camera_config['look_at'][0] == camera_config['look_at'][-1] else "not-a-knot"
-                )
-                up = np.array(camera_config['up'], dtype=np.float32)
-            render_projection = utils3d.np.perspective_from_fov(fov_y=np.deg2rad(camera_config['fov']), near=0.01, far=np.inf, aspect_ratio=render_width / render_height)
-            
-            
-            def blended_eye_traj(frame_idx):
-                if frame_idx < transition_frames:
-                    # Blend between computed and user trajectory
-                    alpha = frame_idx / transition_frames  # 0 to 1
-                    # Use spline interpolation for smooth computed trajectory
-                    if eye_spline is not None:
-                        computed_eye = eye_spline(frame_idx)
+                if p_list:
+                    p = np.concatenate(p_list, axis=0)
+                    q = np.concatenate(q_list, axis=0)
+                    weights = np.concatenate(w_list, axis=0)
+                    if p.shape[0] < 10:
+                        pose = self.poses[-1].copy()
+                        inliers = np.zeros(p.shape[0], dtype=bool)
                     else:
-                        computed_eye = smoothed_eye_positions[int(frame_idx)]
-                    user_eye = user_eye_traj(frame_idx)
-                    return computed_eye * (1 - alpha) + user_eye * alpha
+                        pose, inliers = solve_pose_ransac(p, q, weights)
+                    inlier_mask = np.zeros_like(curr_mask, dtype=bool)
+                    all_pixels = np.concatenate(pixel_indices, axis=0)
+                    all_pixels = all_pixels[inliers]
+                    inlier_mask[all_pixels // width, all_pixels % width] = True
                 else:
-                    # Use user trajectory after transition
-                    return user_eye_traj(frame_idx)
-            
-            # Pre-compute all point cloud centers for smooth look_at trajectory
-            raw_look_at_centers = []
-            for idx in range(num_frames):
-                if accumulate_pc_interval > 0:
-                    # Collect frame indices: current frame + previous frames every k frames
-                    frame_indices = []
-                    for prev_idx in range(0, idx + 1, accumulate_pc_interval):
-                        frame_indices.append(prev_idx)
-                    # Always include current frame
-                    if idx not in frame_indices:
-                        frame_indices.append(idx)
-                    frame_indices.sort()
-                    
-                    # Collect all points from selected frames
-                    all_points = []
-                    for frame_idx_sel in frame_indices:
-                        frame_mask = prediction_frames[frame_idx_sel][1]
-                        frame_points = canonical_points_frames[frame_idx_sel][frame_mask]
-                        if len(frame_points) > 0:
-                            all_points.append(frame_points)
-                    
-                    if len(all_points) > 0:
-                        combined_points = np.concatenate(all_points, axis=0)
-                        center = combined_points.mean(axis=0)
-                    else:
-                        # Fallback to global point cloud center
-                        all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
-                        center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
-                else:
-                    # Only use current frame point cloud center
-                    _, mask = prediction_frames[idx]
-                    frame_points = canonical_points_frames[idx][mask]
-                    if len(frame_points) > 0:
-                        center = frame_points.mean(axis=0)
-                    else:
-                        # Fallback to global point cloud center
-                        all_points = np.concatenate([canonical_points_frames[i][prediction_frames[i][1]] for i in range(num_frames)], axis=0)
-                        center = all_points.mean(axis=0) if len(all_points) > 0 else np.array([0, 0, 0], dtype=np.float32)
-                raw_look_at_centers.append(center)
-            
-            raw_look_at_centers = np.array(raw_look_at_centers, dtype=np.float32)
-            
-            # Apply strong smoothing to look_at centers to reduce jitter
-            # Use larger window for look_at smoothing
-            smoothed_look_at_centers = smooth_trajectory(raw_look_at_centers, window_size=9)
-            
-            # Apply exponential moving average for additional smoothing
-            def exponential_smooth(positions, alpha=0.3):
-                """Apply exponential moving average for smoother transitions."""
-                if len(positions) < 2:
-                    return positions
-                smoothed = np.zeros_like(positions)
-                smoothed[0] = positions[0]
-                for i in range(1, len(positions)):
-                    smoothed[i] = alpha * positions[i] + (1 - alpha) * smoothed[i-1]
-                return smoothed
-            
-            # Apply exponential smoothing on top of moving average
-            smoothed_look_at_centers = exponential_smooth(smoothed_look_at_centers, alpha=0.4)
-            
-            # Create spline interpolation for smooth look_at trajectory
-            if num_frames > 3:
-                frame_indices = np.arange(num_frames, dtype=np.float32)
-                look_at_center_spline = CubicSpline(frame_indices, smoothed_look_at_centers, bc_type='natural')
-            else:
-                look_at_center_spline = None
-            
-            def blended_look_at_traj(frame_idx):
-                # Use spline-interpolated smoothed point cloud center as look_at target
-                if look_at_center_spline is not None:
-                    return look_at_center_spline(frame_idx)
-                else:
-                    return smoothed_look_at_centers[int(frame_idx)]
+                    pose = self.poses[-1].copy()
+                    inlier_mask = np.zeros_like(curr_mask, dtype=bool)
 
-        # Save input video
-        Path(output_path, video_name, 'video').mkdir(exist_ok=True)
-        write_video(Path(output_path, video_name, 'video', 'input.mp4'), image_frames, fps=fps)
+            curr_points_world = apply_transform(curr_points, pose)
+            self.masks.append(curr_mask)
+            self.points_local.append(curr_points)
+            self.points_world.append(curr_points_world.astype(np.float32))
+            self.poses.append(pose)
+            self.intrinsics.append(intrinsics)
+            self._save_frame_result(i_curr, curr_points, curr_mask, pose, intrinsics, depth, inlier_mask)
 
-        # Helper function to generate color for each frame index
-        def get_camera_color(frame_idx, total_frames, alpha=0.8):
-            """
-            Generate a color for camera frustum based on frame index.
-            Uses HSV color space to generate distinct colors.
-            """
-            # Map frame index to hue (0-360 degrees in HSV)
-            hue = (frame_idx / max(total_frames - 1, 1)) * 300  # Use 0-300 range for better colors
-            # Use high saturation and value for vibrant colors
-            saturation = 200 + int(55 * alpha)  # 200-255
-            value = 200 + int(55 * alpha)  # 200-255
-            
-            # Convert HSV to BGR (OpenCV uses BGR, and HSV hue is 0-180)
-            hsv_color = np.uint8([[[int(hue / 2), saturation, value]]])  # OpenCV uses 0-180 for hue
-            bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0, 0]
-            return tuple(int(c) for c in bgr_color)
+    def _save_frame_result(self, idx, points, mask, pose, intrinsics, depth, inlier_mask):
+        prefix = f'{idx:05d}'
+        cv2.imwrite(str(self.result_dir / f'{prefix}_points.exr'), points.astype(np.float32))
+        cv2.imwrite(str(self.result_dir / f'{prefix}_mask.png'), (mask * 255).astype(np.uint8))
+        cv2.imwrite(str(self.result_dir / f'{prefix}_depth_registered.exr'), depth.astype(np.float32))
+        cv2.imwrite(str(self.result_dir / f'{prefix}_inlier_mask.png'), (inlier_mask * 255).astype(np.uint8))
+        np.savez(str(self.result_dir / f'{prefix}_cam.npz'), pose=pose, intrinsics=intrinsics)
 
-        # Calculate frustum size based on point cloud scale
-        # Use a fraction of the point cloud bbox size for frustum visualization
-        if len(all_points) > 0:
-            bbox_min = all_points.min(axis=0)
-            bbox_max = all_points.max(axis=0)
-            bbox_size = np.linalg.norm(bbox_max - bbox_min)
-            # Use 2% of bbox size as frustum depth, with a minimum of 0.01
-            base_frustum_size = max(bbox_size * 0.02, 0.01)
-        else:
-            base_frustum_size = 0.1
-        
-        # Render per-frame point cloud
-        render_frames = []
-        for idx in trange(num_frames, desc='Render'):
-            _, mask = prediction_frames[idx]
-            render_view = utils3d.np.view_look_at(eye=blended_eye_traj(idx), look_at=blended_look_at_traj(idx), up=up).astype(np.float32)
+    def rescale_scene(self, target_scale: float = 1.0) -> float:
+        """Normalize world points and camera translations to a target bbox diagonal."""
+        valid_points = [
+            points[mask]
+            for points, mask in zip(self.points_world, self.masks)
+            if points.shape[:2] == mask.shape and np.any(mask)
+        ]
+        if not valid_points:
+            raise RuntimeError("Cannot rescale scene because no valid points were generated.")
 
-            # Collect points from current frame and previous frames (every k frames)
-            if accumulate_pc_interval > 0:
-                # Collect frame indices: current frame + previous frames every k frames
-                frame_indices = []
-                for prev_idx in range(0, idx + 1, accumulate_pc_interval):
-                    frame_indices.append(prev_idx)
-                # Always include current frame
-                if idx not in frame_indices:
-                    frame_indices.append(idx)
-                frame_indices.sort()
-                
-                # Collect all points and colors from selected frames
-                all_points = []
-                all_colors = []
-                for frame_idx in frame_indices:
-                    frame_mask = prediction_frames[frame_idx][1]
-                    frame_points = canonical_points_frames[frame_idx][frame_mask]
-                    frame_colors = image_frames[frame_idx][frame_mask]
-                    all_points.append(frame_points)
-                    all_colors.append(frame_colors)
-                
-                # Concatenate all points and colors
-                combined_points = np.concatenate(all_points, axis=0).astype(np.float32)
-                combined_colors = np.concatenate(all_colors, axis=0).astype(np.float32)
-                
-                # Normalize colors if needed
-                if combined_colors.max() <= 1.0:
-                    combined_colors = (combined_colors * 255).astype(np.uint8)
-                else:
-                    combined_colors = combined_colors.astype(np.uint8)
-            else:
-                # Only render current frame
-                combined_points = canonical_points_frames[idx][mask].astype(np.float32)
-                combined_colors = image_frames[idx][mask]
-                if combined_colors.max() <= 1.0:
-                    combined_colors = (combined_colors * 255).astype(np.uint8)
-                else:
-                    combined_colors = combined_colors.astype(np.uint8)
+        all_points = np.concatenate(valid_points, axis=0)
+        center = all_points.mean(axis=0)
+        bbox_size = float(np.linalg.norm(all_points.max(axis=0) - all_points.min(axis=0)))
+        if bbox_size <= 1e-8:
+            raise RuntimeError("Cannot rescale scene because the point cloud bbox is degenerate.")
 
-            # Render point cloud
-            render_output = utils3d.np.rasterize_point_cloud(
-                (render_height, render_width),
-                points=combined_points,
-                attributes=combined_colors.astype(np.float32),
-                point_sizes=3,
-                point_shape='circle',
-                view=render_view,
-                projection=render_projection,
-                return_depth=True
-            )
-            
-            # Prepare point cloud image
-            point_cloud_image = render_output['image'].copy()
-            if point_cloud_image.max() <= 1.0:
-                point_cloud_image = (point_cloud_image * 255).astype(np.uint8)
-            else:
-                point_cloud_image = point_cloud_image.astype(np.uint8)
-            
-            # Create a white canvas
-            render_image = np.ones((render_height, render_width, 3), dtype=np.uint8) * 255
-            
-            # First composite point cloud (only where mask is True)
-            render_image = np.where(render_output['mask'][:, :, None], point_cloud_image, render_image).astype(np.uint8)
-            
-            # Create a separate image for all frustums (draw on white background first)
-            frustum_image = np.ones((render_height, render_width, 3), dtype=np.uint8) * 255
-            frustum_image_bgr = cv2.cvtColor(frustum_image, cv2.COLOR_RGB2BGR)
-            
-            # Draw all historical camera frustums (from frame 0 to current frame)
-            for hist_idx in range(idx + 1):
-                hist_pose, hist_intrinsics = pose_frames[hist_idx]
-                hist_extrinsics = np.linalg.inv(hist_pose)
-                
-                # Get color for this historical camera
-                camera_color_bgr = get_camera_color(hist_idx, num_frames)
-                
-                # Create camera frustum mesh
-                # Use base_frustum_size calculated from point cloud scale
-                camera_vertices, camera_edges, _ = utils3d.np.create_camera_frustum_mesh(hist_extrinsics, hist_intrinsics, base_frustum_size)
-                
-                # Transform vertices from camera space to world space (if needed)
-                # create_camera_frustum_mesh may return vertices in camera space, so transform to world space using pose
-                vertices_world = utils3d.np.transform_points(camera_vertices, hist_pose)
-                
-                # Transform vertices to clip space
-                vertices_homogeneous = np.concatenate([vertices_world, np.ones((vertices_world.shape[0], 1), dtype=np.float32)], axis=1)
-                vertices_clip = (render_projection @ render_view @ vertices_homogeneous.T).T
-                
-                # Perspective divide
-                vertices_ndc = vertices_clip[:, :3] / (vertices_clip[:, 3:4] + 1e-8)
-                
-                # Convert to screen coordinates
-                vertices_screen = np.zeros((vertices_world.shape[0], 2), dtype=np.int32)
-                vertices_screen[:, 0] = ((vertices_ndc[:, 0] + 1) * 0.5 * render_width).astype(np.int32)
-                vertices_screen[:, 1] = ((1 - vertices_ndc[:, 1]) * 0.5 * render_height).astype(np.int32)
-                
-                # Draw all frustum edges with the assigned color
-                for edge in camera_edges:
-                    v0_idx, v1_idx = edge[0], edge[1]
-                    w0, w1 = vertices_clip[v0_idx, 3], vertices_clip[v1_idx, 3]
-                    if w0 > 0 and w1 > 0:
-                        ndc0 = vertices_ndc[v0_idx]
-                        ndc1 = vertices_ndc[v1_idx]
-                        if not ((ndc0[0] < -1 and ndc1[0] < -1) or (ndc0[0] > 1 and ndc1[0] > 1) or
-                                (ndc0[1] < -1 and ndc1[1] < -1) or (ndc0[1] > 1 and ndc1[1] > 1)):
-                            pt0 = (int(np.clip(vertices_screen[v0_idx, 0], 0, render_width - 1)), 
-                                   int(np.clip(vertices_screen[v0_idx, 1], 0, render_height - 1)))
-                            pt1 = (int(np.clip(vertices_screen[v1_idx, 0], 0, render_width - 1)), 
-                                   int(np.clip(vertices_screen[v1_idx, 1], 0, render_height - 1)))
-                            # Use different line width for current frame (thicker) vs historical frames
-                            line_width = 3 if hist_idx == idx else 2
-                            cv2.line(frustum_image_bgr, pt0, pt1, camera_color_bgr, line_width)
-            
-            # Convert frustum image back to RGB
-            frustum_image = cv2.cvtColor(frustum_image_bgr, cv2.COLOR_BGR2RGB)
-            
-            # Create mask for frustum pixels (any non-white pixels)
-            frustum_mask = ~np.all(frustum_image == 255, axis=2)
-            
-            # Composite: overlay frustum on top of point cloud
-            # Where frustum exists, use frustum, otherwise use point cloud/background
-            render_image = np.where(
-                frustum_mask[:, :, None], 
-                frustum_image, 
-                render_image
-            ).astype(np.uint8)
-            render_frames.append(render_image)
+        scale_factor = float(target_scale) / bbox_size
+        print(
+            f"Rescaling VDA scene: bbox={bbox_size:.6f}, "
+            f"target={target_scale:.6f}, scale_factor={scale_factor:.6f}"
+        )
+        for i in range(len(self.points_world)):
+            self.points_world[i] = ((self.points_world[i] - center) * scale_factor + center).astype(np.float32)
+            self.poses[i] = self.poses[i].copy()
+            self.poses[i][:3, 3] = (self.poses[i][:3, 3] - center) * scale_factor + center
 
-        # Save rendered video
-        output_width = 720
-        output_video_frames = []
-        for i in range(num_frames):
-            output_image = np.concatenate([
-                cv2.resize(image_frames[i], (output_width, int(output_width / input_width * input_height))),
-                cv2.resize(render_frames[i], (output_width, int(output_width / render_width * render_height))),
-            ], axis=0)
-            output_video_frames.append(output_image)
-        write_video(Path(output_path, video_name, 'video', 'render.mp4'), output_video_frames, fps=fps)
+        return scale_factor
 
+    def process_point_cloud(self, voxel_size: float = 0.002, combined_stride: int = 15) -> Tuple[np.ndarray, np.ndarray]:
+        print("Merging Point Clouds...")
+        all_points, all_colors = [], []
+        pc_dir = self.output_dir / 'pointclouds'
+        pc_dir.mkdir(exist_ok=True)
+        combined_stride = max(int(combined_stride), 1)
+
+        count = min(len(self.images), len(self.masks), len(self.points_world))
+        for i in tqdm(range(count), desc='Exporting PLY'):
+            mask = self.masks[i]
+            pts = self.points_world[i][mask]
+            colors = self.images[i][mask]
+            write_ply(pc_dir / f'frame_{i:05d}.ply', pts, colors)
+
+            if i % combined_stride == 0 and len(pts) > 0:
+                all_points.append(pts)
+                all_colors.append(colors)
+
+        if not all_points:
+            raise RuntimeError("No valid point clouds were generated.")
+
+        combined_pts = np.concatenate(all_points, axis=0)
+        combined_col = np.concatenate(all_colors, axis=0)
+
+        if voxel_size > 0:
+            print(f"Downsampling (Voxel: {voxel_size})...")
+            import open3d as o3d
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(combined_pts.astype(np.float64))
+            pcd.colors = o3d.utility.Vector3dVector(combined_col.astype(np.float64) / 255.0)
+            pcd = pcd.voxel_down_sample(voxel_size)
+            combined_pts = np.asarray(pcd.points).astype(np.float32)
+            combined_col = (np.asarray(pcd.colors) * 255).astype(np.uint8)
+
+        write_ply(self.output_dir / 'combined_pointcloud.ply', combined_pts, combined_col)
+        return combined_pts, combined_col
+
+
+@click.command()
+@click.option('--video', 'video_path', required=True, type=str, help='Path to video file or image folder.')
+@click.option('--output', 'output_path', default='video_output', help='Root output directory.')
+@click.option('--pretrained', default='pretrained/video_depth_anything_vitl.pth', help='Video Depth Anything checkpoint path.')
+@click.option('--encoder', type=click.Choice(['vits', 'vitb', 'vitl']), default='vitl', help='Video Depth Anything encoder size.')
+@click.option('--metric', is_flag=True, help='Use a metric Video Depth Anything checkpoint.')
+@click.option('--fov', 'fov_x', type=float, default=None, help='Horizontal FOV override.')
+@click.option('--input-size', type=int, default=640, help='Resize input video to this longer side dimension.')
+@click.option('--input-size-model', type=int, default=518, help='VDA model inference input size.')
+@click.option('--target-fps', type=int, default=-1, help='VDA target FPS. -1 keeps original/loaded frame rate.')
+@click.option('--start', type=int, default=None, help='Start frame.')
+@click.option('--end', type=int, default=None, help='End frame.')
+@click.option('--skip', type=int, default=1, help='Skip frames.')
+@click.option('--fps', type=int, default=24, help='Output video FPS.')
+@click.option('--voxel-size', type=float, default=0.002, help='Voxel size for global point cloud (0 to disable).')
+@click.option('--combined-stride', type=int, default=15, help='Add every Nth frame to combined_pointcloud.ply. Use 1 to include every frame.')
+@click.option('--accumulate', 'accumulate_interval', type=int, default=0, help='Accumulate points every k frames for rendering. 0 keeps all previous frame point clouds.')
+@click.option('--camera-distance', type=float, default=1.35, help='Multiplier that moves the render camera farther from the look-at point.')
+@click.option('--camera-height', type=float, default=0.15, help='Camera height offset as a fraction of the scene bounding-box diagonal.')
+@click.option('--render-point-size', type=int, default=1, help='Rendered point splat size in pixels. Use 1 for the finest point cloud.')
+@click.option('--pullback-frames', type=int, default=0, help='Append this many pullback frames after trajectory following.')
+@click.option('--pullback-distance', type=float, default=3.0, help='Pullback distance as a fraction of the scene bounding-box diagonal.')
+@click.option('--ref-offset', 'ref_offsets', multiple=True, type=int, default=(1, 5, 21), help='Reference frame offsets for registration. Can be repeated.')
+@click.option('--invert-depth/--no-invert-depth', default=True, help='Invert VDA output before back-projection. Relative VDA checkpoints usually need this.')
+@click.option('--depth-scale', type=float, default=1.0, help='Manual affine scale applied to VDA depth before back-projection.')
+@click.option('--depth-shift', type=float, default=0.0, help='Manual affine shift applied to VDA depth before back-projection.')
+@click.option('--align-depth-reference', type=click.Path(path_type=Path), default=None, help='Reference result/ cache dir used to estimate VDA depth scale and shift.')
+@click.option('--use-cache/--no-use-cache', default=None, help='Use existing cached reconstruction results without prompting.')
+@click.option('--rescale', is_flag=True, help='Normalize point cloud scale for visualization. Leave unset to render reconstructed scale.')
+@click.option('--target-scale', type=float, default=1.0, help='Target bbox diagonal used with --rescale before PLY export and rendering.')
+def main(
+    video_path,
+    output_path,
+    pretrained,
+    encoder,
+    metric,
+    fov_x,
+    input_size,
+    input_size_model,
+    target_fps,
+    start,
+    end,
+    skip,
+    fps,
+    voxel_size,
+    combined_stride,
+    accumulate_interval,
+    camera_distance,
+    camera_height,
+    render_point_size,
+    pullback_frames,
+    pullback_distance,
+    ref_offsets,
+    invert_depth,
+    depth_scale,
+    depth_shift,
+    align_depth_reference,
+    use_cache,
+    rescale,
+    target_scale,
+):
+    video_path = Path(video_path)
+    output_path = Path(output_path)
+    scene = VdaSceneReconstructor(video_path, output_path)
+
+    print("Reading input frames...")
+    frames = read_frames(video_path, start, end, skip, target_size=input_size)
+    (scene.output_dir / 'video').mkdir(parents=True, exist_ok=True)
+    write_video(scene.output_dir / 'video' / 'input.mp4', frames, fps=fps)
+
+    if scene.has_cached_results():
+        if use_cache is None:
+            use_cache = click.confirm(f"Found existing results in {scene.result_dir}. Do you want to use them?")
+    elif use_cache:
+        raise FileNotFoundError(f"No cached reconstruction results found in {scene.result_dir}")
+    else:
+        use_cache = False
+
+    if use_cache:
+        scene.load_cached_results(frames)
+    else:
+        scene.load_models(pretrained, encoder=encoder, metric=metric)
+        scene.run_inference(
+            frames,
+            fov_x=fov_x,
+            ref_offsets=list(ref_offsets),
+            input_size_model=input_size_model,
+            target_fps=target_fps,
+            invert_depth=invert_depth,
+            depth_scale=depth_scale,
+            depth_shift=depth_shift,
+            align_depth_reference=align_depth_reference,
+        )
+
+    if rescale:
+        scene.rescale_scene(target_scale=target_scale)
+
+    scene.process_point_cloud(voxel_size=voxel_size, combined_stride=combined_stride)
+    render_sequence(
+        scene,
+        fps=fps,
+        accumulate_interval=accumulate_interval,
+        rescale=False,
+        camera_distance=camera_distance,
+        camera_height=camera_height,
+        render_point_size=render_point_size,
+        pullback_frames=pullback_frames,
+        pullback_distance=pullback_distance,
+    )
+
+    print(f"Processing complete. Results saved to {scene.output_dir}")
 
 
 if __name__ == '__main__':
     main()
-
