@@ -2,8 +2,8 @@
 
 # Stabilizing Streaming Video Geometry via Dynamic Feature Normalization
 
-<a href=""><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
-<a href=''><img src='https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white' alt='Project Page'></a>
+<a href="https://arxiv.org/pdf/2605.25308v1"><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
+<a href='https://shawlyu.github.io/DyFN/'><img src='https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white' alt='Project Page'></a>
 
 </div>
 
@@ -12,6 +12,12 @@
 ---
 
 DyFN improves temporal stability for streaming video geometry estimation while preserving competitive depth accuracy across diverse benchmarks.
+
+Project page: [https://shawlyu.github.io/DyFN/](https://shawlyu.github.io/DyFN/)
+
+## 🔬 Empirical Study
+
+Try the interactive latent-statistics sweep in [`jupyter_demo/SingleFrameScaleShift.ipynb`](jupyter_demo/SingleFrameScaleShift.ipynb). It reproduces the paper's empirical study on how feature mean and variance affect depth scale, shift, and accuracy.
 
 ## 🛠️ Installation
 
